@@ -177,6 +177,21 @@ def _print_comparison_table(results: List[SlippageResult]) -> None:
             f"{last_extra_txt:>14} ${r.slippage_loss_usd:>11,.2f} {all_in_txt:>16}"
         )
 
+    valid_with_fade = [r for r in results if not r.error and r.fade_scenarios]
+    if valid_with_fade:
+        print("-" * 136)
+        print("⚡ 【大单引发做市商瞬时撤单 (Market Maker Quote Fading) 压力测试】")
+        for r in valid_with_fade:
+            s0 = r.fade_scenarios[0]
+            s50 = next((s for s in r.fade_scenarios if abs(s.fade_rate - 0.50) < 1e-6), s0)
+            s70 = next((s for s in r.fade_scenarios if abs(s.fade_rate - 0.70) < 1e-6), s0)
+            print(
+                f"  • {r.exchange_label:<12} | "
+                f"0%撤单(静态): 吃{s0.levels_used:>3}档, 比1档贵 +${s0.vwap_extra_per_coin_usd:>6,.2f}/{r.base_asset} (+{s0.vwap_slippage_bp:>5.2f}bp)  ==>  "
+                f"50%撤单: 吃{s50.levels_used:>3}档, 贵 +${s50.vwap_extra_per_coin_usd:>6,.2f} (+{s50.vwap_slippage_bp:>5.2f}bp, 放大{s50.amplification_vs_static:.1f}x)  ==>  "
+                f"70%撤单: 吃{s70.levels_used:>3}档, 贵 +${s70.vwap_extra_per_coin_usd:>6,.2f} (+{s70.vwap_slippage_bp:>5.2f}bp, 放大{s70.amplification_vs_static:.1f}x)"
+            )
+
     print("-" * 136)
     pitch_lines = build_otc_pitch_lines(results)
     if pitch_lines:

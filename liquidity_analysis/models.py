@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Data models for multi-exchange order book depth, slippage estimation, OTC comparison, and verification."""
+"""Data models for multi-exchange order book depth, slippage estimation, Maker withdrawal simulation, and verification."""
 
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,6 +16,36 @@ class DepthBand:
     cum_usd: float
     cum_hkd: float
     levels_count: int
+
+
+@dataclass
+class FadeScenario:
+    """
+    Simulated execution outcome when Market Makers pull `fade_rate` (e.g. 50% or 70%)
+    of resting liquidity after the initial fill / across child sweeps.
+    """
+
+    fade_rate: float  # 0.0 ~ 0.90 (e.g. 0.50 = 50% of deeper maker orders cancelled)
+    label: str  # e.g. "静态理想 (0%撤单)", "常规HFT撤单 (50%撤单)", "剧烈联动撤单 (70%撤单)"
+    levels_used: int
+    filled_qty: float
+    fill_ratio: float
+    depth_exhausted: bool
+    vwap_usd: float
+    vwap_hkd: float
+    last_price_usd: float
+    last_price_hkd: float
+    vwap_extra_per_coin_usd: float
+    vwap_extra_per_coin_hkd: float
+    last_extra_per_coin_usd: float
+    vwap_slippage_bp: float
+    last_slippage_bp: float
+    slippage_loss_usd: float
+    slippage_loss_hkd: float
+    all_in_cost_bp: float
+    all_in_loss_usd: float
+    all_in_loss_hkd: float
+    amplification_vs_static: float  # Multiple of static slippage bp (e.g. 2.4x)
 
 
 @dataclass
@@ -76,6 +106,7 @@ class SlippageResult:
     target_notional_quote: Optional[float]  # Target converted to book quote currency
     target_qty: Optional[float]  # Target in base asset units (if qty mode)
     fx_usd_hkd: float
+    applied_fade_rate: float  # Primary fade rate applied to main metrics (default 0.0)
 
     # Book top & Level-1 liquidity ("screen price illusion" metrics)
     top_bid: float
@@ -133,12 +164,13 @@ class SlippageResult:
     fill_ratio: float  # 0.0 ~ 1.0
     depth_exhausted: bool
 
-    # Depth ladder (e.g. 5bp, 10bp, 25bp, 50bp, 100bp)
+    # Depth ladder & Market Maker withdrawal stress-test scenarios
     depth_bands: List[DepthBand] = field(default_factory=list)
+    fade_scenarios: List[FadeScenario] = field(default_factory=list)
     latency_ms: float = 0.0
     sequence_id: Optional[str] = None
     note: str = (
-        "静态盘口估算，真正在盘面扫单时高频做市商会动态撤单，实际滑点通常为静态值的 1.5~2.5 倍"
+        "静态盘口估算，真正在盘面扫单时高频做市商会动态撤单，实际滑点通常显著高于静态值"
     )
     error: Optional[str] = None
 

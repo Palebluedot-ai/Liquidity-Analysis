@@ -324,9 +324,30 @@ def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
             f"**`${r.all_in_loss_usd:,.2f}`** (+{r.all_in_cost_bp:.2f}bp) |"
         )
 
+    valid_with_fade = [r for r in results if not r.error and r.fade_scenarios]
+    if valid_with_fade:
+        lines.append(
+            "\n---\n### 二、⚡ 大单引发做市商瞬时撤单 (Quote Fading) 压力测试"
+        )
+        lines.append(
+            "| 交易所 | 0%撤单 (静态理想) | 50%撤单 (常规HFT退避) | 70%撤单 (剧烈/跨所撤单) | 撤单滑点放大倍数 |\n"
+            "|---|---|---|---|---|"
+        )
+        for r in valid_with_fade:
+            s0 = r.fade_scenarios[0]
+            s50 = next((s for s in r.fade_scenarios if abs(s.fade_rate - 0.50) < 1e-6), s0)
+            s70 = next((s for s in r.fade_scenarios if abs(s.fade_rate - 0.70) < 1e-6), s0)
+            lines.append(
+                f"| **{r.exchange_label}** | "
+                f"吃 **{s0.levels_used}档** / `+${s0.vwap_extra_per_coin_usd:,.2f}` (+{s0.vwap_slippage_bp:.2f}bp) | "
+                f"吃 **{s50.levels_used}档** / **`+${s50.vwap_extra_per_coin_usd:,.2f}`** (+{s50.vwap_slippage_bp:.2f}bp, 损`${s50.slippage_loss_usd:,.0f}`) | "
+                f"吃 **{s70.levels_used}档** / **`+${s70.vwap_extra_per_coin_usd:,.2f}`** (+{s70.vwap_slippage_bp:.2f}bp, 损`${s70.slippage_loss_usd:,.0f}`) | "
+                f"**{s50.amplification_vs_static:.1f}x ~ {s70.amplification_vs_static:.1f}x** |"
+            )
+
     pitch_lines = build_otc_pitch_lines(results)
     if pitch_lines:
-        lines.append("\n---\n### 二、💡 OTC Block Trade 客户对比话术（可直接复制）")
+        lines.append("\n---\n### 三、💡 OTC Block Trade 客户对比话术（可直接复制）")
         lines.extend(pitch_lines)
 
     ex_str = ",".join(r.exchange for r in results if not r.error) or "binance,okx"

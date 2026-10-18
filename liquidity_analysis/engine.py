@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Core slippage calculation engine, liquidity depth profiler, multi-exchange comparator,
-OTC Block Trade value-proposition analyzer, and Maker order authenticity verifier.
+Market Maker withdrawal (Quote Fading) simulator, and Maker order authenticity verifier.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,10 +16,35 @@ from .exchanges import (
     fetch_recent_trades,
 )
 from .fx import convert_notional_to_quote, get_usd_hkd_rate, quote_to_usd_and_hkd
-from .models import DepthBand, OrderBookSnapshot, SlippageResult, VerificationReport
+from .models import (
+    DepthBand,
+    FadeScenario,
+    OrderBookSnapshot,
+    SlippageResult,
+    VerificationReport,
+)
 
 DEFAULT_BP_BANDS: Tuple[float, ...] = (5.0, 10.0, 25.0, 50.0, 100.0)
-DEFAULT_TAKER_FEE_BP: float = 5.0  # Institutional VIP Taker fee benchmark (5 bp = 0.05%; retail is 10 bp)
+DEFAULT_TAKER_FEE_BP: float = 5.0  # Institutional VIP Taker fee benchmark (5 bp = 0.05%)
+DEFAULT_FADE_SCENARIOS: Tuple[Tuple[float, str], ...] = (
+    (0.0, "0% 静态理想盘口"),
+    (0.50, "50% 常规做市商撤单"),
+    (0.70, "70% 剧烈/跨所联动撤单"),
+)
+
+
+def apply_maker_fade(
+    levels: Sequence[Tuple[float, float]], fade_rate: float
+) -> List[Tuple[float, float]]:
+    """
+    Simulate Market Maker withdrawal (Quote Fading / Liquidity Haircut):
+    When a large order sweeps the book (or is split across child orders / exchanges),
+    HFT market makers react within 5-20ms and cancel `fade_rate` (0.0 ~ 0.90) of resting orders.
+    """
+    if fade_rate <= 0.0:
+        return list(levels)
+    keep = max(0.05, 1.0 - min(fade_rate, 0.95))
+    return [(p, q * keep) for p, q in levels]
 
 
 def walk_book(
@@ -30,13 +55,6 @@ def walk_book(
 ) -> Dict[str, Any]:
     """
     Walk static order book levels [(price, qty)] from best to worst.
-
-    Parameters:
-        levels: [(price, qty)] ordered from best price to worst price.
-        target_usd: Target notional in book quote currency (named target_usd for backward compatibility).
-        target_qty: Target base asset quantity.
-        allow_partial: If True, returns partial fill metrics with `depth_exhausted=True`
-                       instead of raising RuntimeError when book depth is insufficient.
     """
     if (target_usd is None) == (target_qty is None):
         raise ValueError("target_usd 与 target_qty 必须且只能指定一个")
@@ -91,9 +109,7 @@ def walk_book(
 def adverse_slippage_bp(ref_price: float, exec_price: float, side: str) -> float:
     """
     Calculate adverse execution slippage in basis points (bp).
-    Positive value ALWAYS means worse price than `ref_price`:
-      - sell: (ref_price - exec_price) / ref_price * 1e4
-      - buy : (exec_price - ref_price) / ref_price * 1e4
+    Positive value ALWAYS means worse price than `ref_price`.
     """
     if ref_price <= 0 or exec_price <= 0:
         return 0.0
@@ -152,6 +168,77 @@ def compute_depth_bands(
     return bands
 
 
+def _compute_fade_scenario(
+    raw_levels: Sequence[Tuple[float, float]],
+    fade_rate: float,
+    label: str,
+    side_norm: str,
+    quote_asset: str,
+    rate: float,
+    top_price: float,
+    top_price_usd: float,
+    top_price_hkd: float,
+    target_quote: Optional[float],
+    qty: Optional[float],
+    taker_fee_bp: float,
+    static_slip_bp: Optional[float] = None,
+) -> FadeScenario:
+    adj_levels = apply_maker_fade(raw_levels, fade_rate)
+    w = walk_book(
+        adj_levels,
+        target_usd=target_quote,
+        target_qty=qty,
+        allow_partial=True,
+    )
+    cost_usd, cost_hkd = quote_to_usd_and_hkd(w["cost_usd"], quote_asset, rate)
+    vwap_usd, vwap_hkd = quote_to_usd_and_hkd(w["vwap"], quote_asset, rate)
+    last_usd, last_hkd = quote_to_usd_and_hkd(w["last_price"], quote_asset, rate)
+
+    if side_norm == "buy":
+        vwap_extra_usd = vwap_usd - top_price_usd
+        vwap_extra_hkd = vwap_hkd - top_price_hkd
+        last_extra_usd = last_usd - top_price_usd
+    else:
+        vwap_extra_usd = top_price_usd - vwap_usd
+        vwap_extra_hkd = top_price_hkd - vwap_hkd
+        last_extra_usd = top_price_usd - last_usd
+
+    vwap_slip_bp = adverse_slippage_bp(top_price, w["vwap"], side_norm)
+    last_slip_bp = adverse_slippage_bp(top_price, w["last_price"], side_norm)
+    slip_loss_usd = cost_usd * (vwap_slip_bp / 1e4)
+    slip_loss_hkd = cost_hkd * (vwap_slip_bp / 1e4)
+    all_in_bp = vwap_slip_bp + taker_fee_bp
+    all_in_usd = slip_loss_usd + cost_usd * (taker_fee_bp / 1e4)
+    all_in_hkd = slip_loss_hkd + cost_hkd * (taker_fee_bp / 1e4)
+
+    base_bp = static_slip_bp if (static_slip_bp is not None and static_slip_bp > 1e-4) else vwap_slip_bp
+    amp = (vwap_slip_bp / base_bp) if base_bp > 1e-4 else 1.0
+
+    return FadeScenario(
+        fade_rate=fade_rate,
+        label=label,
+        levels_used=w["levels_used"],
+        filled_qty=w["filled_qty"],
+        fill_ratio=w["fill_ratio"],
+        depth_exhausted=w["depth_exhausted"],
+        vwap_usd=vwap_usd,
+        vwap_hkd=vwap_hkd,
+        last_price_usd=last_usd,
+        last_price_hkd=last_hkd,
+        vwap_extra_per_coin_usd=vwap_extra_usd,
+        vwap_extra_per_coin_hkd=vwap_extra_hkd,
+        last_extra_per_coin_usd=last_extra_usd,
+        vwap_slippage_bp=vwap_slip_bp,
+        last_slippage_bp=last_slip_bp,
+        slippage_loss_usd=slip_loss_usd,
+        slippage_loss_hkd=slip_loss_hkd,
+        all_in_cost_bp=all_in_bp,
+        all_in_loss_usd=all_in_usd,
+        all_in_loss_hkd=all_in_hkd,
+        amplification_vs_static=amp,
+    )
+
+
 def evaluate_snapshot(
     snapshot: OrderBookSnapshot,
     side: str,
@@ -160,9 +247,10 @@ def evaluate_snapshot(
     qty: Optional[float] = None,
     fx_usd_hkd: Optional[float] = None,
     taker_fee_bp: float = DEFAULT_TAKER_FEE_BP,
+    fade_rate: float = 0.0,
     allow_partial: bool = True,
 ) -> SlippageResult:
-    """Evaluate slippage, Level-1 vs VWAP extra cost, and OTC comparison metrics on a snapshot."""
+    """Evaluate slippage, Level-1 vs VWAP extra cost, and Maker withdrawal stress-test scenarios."""
     side_norm = side.lower().strip()
     if side_norm not in ("buy", "sell"):
         raise ValueError(f"side 必须是 'buy' 或 'sell' (收到: {side!r})")
@@ -173,7 +261,9 @@ def evaluate_snapshot(
 
     rate = fx_usd_hkd if (fx_usd_hkd and fx_usd_hkd > 0) else get_usd_hkd_rate()[0]
 
-    levels = snapshot.bids if side_norm == "sell" else snapshot.asks
+    raw_levels = snapshot.bids if side_norm == "sell" else snapshot.asks
+    levels = apply_maker_fade(raw_levels, fade_rate)
+
     top_bid = snapshot.best_bid
     top_ask = snapshot.best_ask
     mid = snapshot.mid_price
@@ -184,7 +274,7 @@ def evaluate_snapshot(
     )
 
     # Level-1 resting liquidity ("screen price illusion")
-    level1_qty = levels[0][1] if levels else 0.0
+    level1_qty = raw_levels[0][1] if raw_levels else 0.0
     level1_quote = top_price * level1_qty
     level1_usd, level1_hkd = quote_to_usd_and_hkd(
         level1_quote, snapshot.quote_asset, rate
@@ -219,7 +309,6 @@ def evaluate_snapshot(
     last_quote = walk["last_price"]
     last_usd, last_hkd = quote_to_usd_and_hkd(last_quote, snapshot.quote_asset, rate)
 
-    # Level-1 fill share percentage of target order
     if target_usd and target_usd > 0:
         level1_fill_pct = min(100.0, (level1_usd / target_usd) * 100.0)
     elif qty and qty > 0:
@@ -227,7 +316,6 @@ def evaluate_snapshot(
     else:
         level1_fill_pct = 0.0
 
-    # Extra cost per coin vs Level-1 price (positive = worse for trader)
     if side_norm == "buy":
         vwap_extra_usd = vwap_usd - top_price_usd
         vwap_extra_hkd = vwap_hkd - top_price_hkd
@@ -246,11 +334,9 @@ def evaluate_snapshot(
         (top_price - vwap_quote) / top_price * 1e4 if top_price > 0 else 0.0
     )
 
-    # Dollar slippage loss vs executing whole order at Level-1 price
     slippage_loss_usd = cost_usd * (vwap_slip_bp / 1e4)
     slippage_loss_hkd = cost_hkd * (vwap_slip_bp / 1e4)
 
-    # Exchange Taker fee & All-in execution cost
     taker_fee_usd = cost_usd * (taker_fee_bp / 1e4)
     taker_fee_hkd = cost_hkd * (taker_fee_bp / 1e4)
     all_in_cost_bp = vwap_slip_bp + taker_fee_bp
@@ -261,13 +347,36 @@ def evaluate_snapshot(
     else:
         all_in_vwap_usd = vwap_usd * (1.0 - taker_fee_bp / 1e4)
 
-    book_total_quote = sum(p * q for p, q in levels)
-    book_total_qty = sum(q for _, q in levels)
+    book_total_quote = sum(p * q for p, q in raw_levels)
+    book_total_qty = sum(q for _, q in raw_levels)
     book_total_usd, book_total_hkd = quote_to_usd_and_hkd(
         book_total_quote, snapshot.quote_asset, rate
     )
 
-    bands = compute_depth_bands(levels, side_norm, snapshot.quote_asset, rate)
+    bands = compute_depth_bands(raw_levels, side_norm, snapshot.quote_asset, rate)
+
+    # Compute standard Maker withdrawal stress-test scenarios (0%, 50%, 70%)
+    fade_scenarios: List[FadeScenario] = []
+    static_bp_ref: Optional[float] = None
+    for f_rate, f_label in DEFAULT_FADE_SCENARIOS:
+        sc = _compute_fade_scenario(
+            raw_levels=raw_levels,
+            fade_rate=f_rate,
+            label=f_label,
+            side_norm=side_norm,
+            quote_asset=snapshot.quote_asset,
+            rate=rate,
+            top_price=top_price,
+            top_price_usd=top_price_usd,
+            top_price_hkd=top_price_hkd,
+            target_quote=target_quote,
+            qty=qty,
+            taker_fee_bp=taker_fee_bp,
+            static_slip_bp=static_bp_ref,
+        )
+        if f_rate == 0.0:
+            static_bp_ref = sc.vwap_slippage_bp
+        fade_scenarios.append(sc)
 
     return SlippageResult(
         exchange=snapshot.exchange,
@@ -283,6 +392,7 @@ def evaluate_snapshot(
         target_notional_quote=target_quote,
         target_qty=qty,
         fx_usd_hkd=rate,
+        applied_fade_rate=fade_rate,
         top_bid=top_bid,
         top_ask=top_ask,
         mid_price=mid,
@@ -322,7 +432,7 @@ def evaluate_snapshot(
         vwap_vs_mid_bp=vwap_vs_mid_bp,
         signed_vwap_diff_bp=signed_diff_bp,
         levels_used=walk["levels_used"],
-        book_levels=len(levels),
+        book_levels=len(raw_levels),
         book_side_total_quote=book_total_quote,
         book_side_total_usd=book_total_usd,
         book_side_total_hkd=book_total_hkd,
@@ -330,6 +440,7 @@ def evaluate_snapshot(
         fill_ratio=walk["fill_ratio"],
         depth_exhausted=walk["depth_exhausted"],
         depth_bands=bands,
+        fade_scenarios=fade_scenarios,
         latency_ms=snapshot.latency_ms,
         sequence_id=snapshot.sequence_id,
     )
@@ -345,6 +456,7 @@ def estimate_single(
     limit: int = 5000,
     fx_rate: Optional[float] = None,
     taker_fee_bp: float = DEFAULT_TAKER_FEE_BP,
+    fade_rate: float = 0.0,
     allow_partial: bool = True,
     prefer_native_hkd: bool = False,
 ) -> SlippageResult:
@@ -365,6 +477,7 @@ def estimate_single(
         qty=qty,
         fx_usd_hkd=rate,
         taker_fee_bp=taker_fee_bp,
+        fade_rate=fade_rate,
         allow_partial=allow_partial,
     )
 
@@ -379,10 +492,12 @@ def compare_exchanges(
     limit: int = 5000,
     fx_rate: Optional[float] = None,
     taker_fee_bp: float = DEFAULT_TAKER_FEE_BP,
+    fade_rate: float = 0.0,
     include_native_hkd_on_hashkey: bool = True,
 ) -> List[SlippageResult]:
     """
-    Fetch order books concurrently across multiple exchanges and compute slippage & OTC comparison.
+    Fetch order books concurrently across multiple exchanges and compute slippage,
+    Maker withdrawal scenarios, and OTC comparison.
     """
     rate, _ = get_usd_hkd_rate(override_rate=fx_rate)
     target_exchanges = list(exchanges) if exchanges else list(DEFAULT_COMPARE_EXCHANGES)
@@ -412,6 +527,7 @@ def compare_exchanges(
                 limit=limit,
                 fx_rate=rate,
                 taker_fee_bp=taker_fee_bp,
+                fade_rate=fade_rate,
                 allow_partial=True,
             )
             return ex_name, res
@@ -431,6 +547,7 @@ def compare_exchanges(
                 target_notional_quote=None,
                 target_qty=qty,
                 fx_usd_hkd=rate,
+                applied_fade_rate=fade_rate,
                 top_bid=0.0,
                 top_ask=0.0,
                 mid_price=0.0,
@@ -506,7 +623,7 @@ def compare_exchanges(
 def build_otc_pitch_lines(results: Sequence[SlippageResult]) -> List[str]:
     """
     Generate sales-ready bullet points highlighting why OTC Block Trade outperforms
-    direct order-book execution for the given order.
+    direct order-book execution (including Market Maker withdrawal stress-test numbers).
     """
     valid = [r for r in results if not r.error]
     if not valid:
@@ -520,7 +637,6 @@ def build_otc_pitch_lines(results: Sequence[SlippageResult]) -> List[str]:
     top_label = "卖一 (Ask 1)" if is_buy else "买一 (Bid 1)"
 
     lines: List[str] = []
-    # 1. Screen price illusion (Level 1 depth)
     l1_parts = [
         f"{r.exchange_label} {top_label} (`${r.top_price_usd:,.2f}`) 仅挂单 `{r.level1_qty:,.4f} {r.base_asset}` "
         f"(`${r.level1_notional_usd:,.0f}`，仅占本单 **{r.level1_fill_pct:.1f}%**)"
@@ -530,24 +646,31 @@ def build_otc_pitch_lines(results: Sequence[SlippageResult]) -> List[str]:
         f"1. **屏幕第 1 档价格假象（Level-1 仅能承接极小比例）**：" + "；".join(l1_parts) + "。"
     )
 
-    # 2. Per-exchange depth penetration & extra cost vs Level 1
     pen_parts = []
     for r in valid:
         status_note = "" if not r.depth_exhausted else f"（⚠️ 且盘口仅够成交 {r.fill_ratio*100:.1f}%）"
+        sc_50 = next((s for s in r.fade_scenarios if abs(s.fade_rate - 0.50) < 1e-6), None)
+        sc_70 = next((s for s in r.fade_scenarios if abs(s.fade_rate - 0.70) < 1e-6), None)
+        fade_note = ""
+        if sc_50 and sc_70:
+            fade_note = (
+                f"；若遭遇 **50% 常规做市商撤单**，实际需吃穿 **{sc_50.levels_used} 档**、"
+                f"每颗 {r.base_asset} 比 1 档{worse_word} **`+${sc_50.vwap_extra_per_coin_usd:,.2f}`** (`+{sc_50.vwap_slippage_bp:.2f}bp`，滑点放大 **{sc_50.amplification_vs_static:.1f}x**，含费损耗 **`${sc_50.all_in_loss_usd:,.0f}`**)"
+                f"；若遭遇 **70% 剧烈联动撤单**，需吃穿 **{sc_70.levels_used} 档**、"
+                f"每颗 {r.base_asset} 比 1 档{worse_word} **`+${sc_70.vwap_extra_per_coin_usd:,.2f}`** (`+{sc_70.vwap_slippage_bp:.2f}bp`，含费损耗 **`${sc_70.all_in_loss_usd:,.0f}`**)"
+            )
         pen_parts.append(
-            f"   - **{r.exchange_label} (`{r.symbol}`)**：需连续吃穿 **{r.levels_used} 档**{status_note}，"
-            f"成交均价 `${r.vwap_usd:,.2f}`（比第 1 档每颗 {r.base_asset} {worse_word} **`+${r.vwap_extra_per_coin_usd:,.2f}`** / `+{r.vwap_slippage_bp:.2f} bp`），"
-            f"最后一口被{push_word}至 `${r.last_price_usd:,.2f}`（比第 1 档差 **`+${r.last_extra_per_coin_usd:,.2f}`** / `+{r.last_slippage_bp:.2f} bp`）；"
-            f"仅静态滑点即{worse_word} **`${r.slippage_loss_usd:,.2f}`**（`HK${r.slippage_loss_hkd:,.0f}`），"
-            f"若加计 `{r.taker_fee_bp:.0f} bp` 交易所 Taker 手续费，盘面全口径综合损耗达 **`+{r.all_in_cost_bp:.2f} bp` (`${r.all_in_loss_usd:,.2f}` / `HK${r.all_in_loss_hkd:,.0f}`)**，等效全包均价 `${r.all_in_vwap_usd:,.2f}`。"
+            f"   - **{r.exchange_label} (`{r.symbol}`)**：静态下需吃穿 **{r.levels_used} 档**{status_note}，"
+            f"均价 `${r.vwap_usd:,.2f}`（比 1 档每颗 {r.base_asset} {worse_word} **`+${r.vwap_extra_per_coin_usd:,.2f}`** / `+{r.vwap_slippage_bp:.2f} bp`），"
+            f"尾档被{push_word}至 `${r.last_price_usd:,.2f}`（差 **`+${r.last_extra_per_coin_usd:,.2f}`**），"
+            f"含 `{r.taker_fee_bp:.0f} bp` Taker 费损耗 **`${r.all_in_loss_usd:,.0f}`**{fade_note}。"
         )
-    lines.append(f"2. **盘面直扫穿透代价（{action_cn}吃单逐档损耗）**：\n" + "\n".join(pen_parts))
+    lines.append(f"2. **盘面直扫穿透代价与做市商撤单放大效应（{action_cn}吃单）**：\n" + "\n".join(pen_parts))
 
-    # 3. Dynamic HFT withdrawal & OTC Block Trade advantage
     lines.append(
         "3. **OTC Block Trade（大宗一口价锁价）核心优势**：\n"
-        "   - **无分档滑点与撤单放大**：上方盘口数据仅为静态理想快照；实盘扫穿数十档时，高频做市商（HFT）在首档成交后 5~20ms 内会动态撤单（Quote Fading），实际滑点往往放大至静态值的 **1.5~2.5 倍**。\n"
-        "   - **零信息泄露 & 一口价确定性**：通过 OTC Block Trade 直接锁死单一成交净价，**不吃档位、不推高/砸穿盘面价格、免交易所 Taker 吃单费**，大额资金一步交割到位。"
+        "   - **彻底免疫做市商撤单（Quote Fading）**：大单受限于交易所单笔市价单上限或跨所拆单时，首波成交后 5~20ms 内高频做市商会瞬间撤走后方 50%~70% 挂单，导致实际成交打入盘口薄尾区、滑点非线性暴增。\n"
+        "   - **零信息泄露 & 一口价确定性**：走 OTC Block Trade 直接锁死单一成交净价，**不吃档位、不触发 HFT 撤单、不推高/砸穿盘面价格、免交易所 Taker 吃单费**。"
     )
     return lines
 

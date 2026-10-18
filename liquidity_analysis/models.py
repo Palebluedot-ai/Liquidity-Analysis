@@ -1,0 +1,170 @@
+# -*- coding: utf-8 -*-
+"""Data models for multi-exchange order book depth, slippage estimation, and verification."""
+
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+
+@dataclass
+class DepthBand:
+    """Cumulative liquidity available within `bp` basis points from top of book."""
+
+    bp: float
+    boundary_price: float
+    cum_qty: float
+    cum_quote: float
+    cum_usd: float
+    cum_hkd: float
+    levels_count: int
+
+
+@dataclass
+class OrderBookSnapshot:
+    """Standardized L2 order book snapshot from an exchange."""
+
+    exchange: str
+    exchange_label: str
+    symbol: str
+    base_asset: str
+    quote_asset: str
+    bids: List[Tuple[float, float]]  # [(price, qty)], sorted high -> low
+    asks: List[Tuple[float, float]]  # [(price, qty)], sorted low -> high
+    sequence_id: Optional[str] = None
+    exchange_ts_ms: Optional[int] = None
+    fetched_at_ms: int = 0
+    latency_ms: float = 0.0
+    max_levels_requested: int = 0
+
+    @property
+    def best_bid(self) -> float:
+        return self.bids[0][0] if self.bids else 0.0
+
+    @property
+    def best_ask(self) -> float:
+        return self.asks[0][0] if self.asks else 0.0
+
+    @property
+    def mid_price(self) -> float:
+        if self.bids and self.asks:
+            return (self.best_bid + self.best_ask) / 2.0
+        return self.best_bid or self.best_ask
+
+    @property
+    def spread_bp(self) -> float:
+        mid = self.mid_price
+        if mid <= 0 or not self.bids or not self.asks:
+            return 0.0
+        return (self.best_ask - self.best_bid) / mid * 1e4
+
+
+@dataclass
+class SlippageResult:
+    """Complete result of walking an exchange order book for a target notional or quantity."""
+
+    exchange: str
+    exchange_label: str
+    symbol: str
+    base_asset: str
+    quote_asset: str
+    side: str  # "buy" or "sell"
+
+    # Input specification
+    input_currency: str  # "USD" or "HKD"
+    target_notional_input: Optional[float]  # Target in input_currency (if notional mode)
+    target_notional_usd: Optional[float]
+    target_notional_hkd: Optional[float]
+    target_notional_quote: Optional[float]  # Target converted to book quote currency
+    target_qty: Optional[float]  # Target in base asset units (if qty mode)
+    fx_usd_hkd: float
+
+    # Book top & spread
+    top_bid: float
+    top_ask: float
+    mid_price: float
+    spread_bp: float
+    top_price: float  # Reference top price for the active side (best_ask for buy, best_bid for sell)
+
+    # Execution metrics (in book quote currency, USD, and HKD)
+    filled_qty: float
+    cost_quote: float
+    cost_usd: float
+    cost_hkd: float
+    vwap_quote: float
+    vwap_usd: float
+    vwap_hkd: float
+    last_price_quote: float
+    last_price_usd: float
+    last_price_hkd: float
+
+    # Slippage metrics (positive bp = adverse execution cost relative to reference)
+    vwap_slippage_bp: float
+    last_slippage_bp: float
+    vwap_vs_mid_bp: float
+    signed_vwap_diff_bp: float  # (top_price - vwap) / top_price * 1e4 (compatible with legacy script)
+
+    # Book capacity & fill status
+    levels_used: int
+    book_levels: int
+    book_side_total_quote: float
+    book_side_total_usd: float
+    book_side_total_hkd: float
+    book_side_total_qty: float
+    fill_ratio: float  # 0.0 ~ 1.0
+    depth_exhausted: bool
+
+    # Depth ladder (e.g. 5bp, 10bp, 25bp, 50bp, 100bp)
+    depth_bands: List[DepthBand] = field(default_factory=list)
+    latency_ms: float = 0.0
+    sequence_id: Optional[str] = None
+    note: str = (
+        "静态盘口估算，未含手续费；真实大额成交时做市商可能动态撤单，实际滑点通常更大"
+    )
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class VerificationReport:
+    """Verification report checking whether displayed Maker orders are valid and persistent."""
+
+    exchange: str
+    exchange_label: str
+    symbol: str
+    samples_count: int
+    interval_sec: float
+
+    # 1. Book structural integrity
+    is_crossed: bool
+    bids_strictly_descending: bool
+    asks_strictly_ascending: bool
+    spread_bp: float
+    best_bid: float
+    best_ask: float
+    sequence_ids: List[Optional[str]]
+    sequence_monotonic: bool
+    exchange_clock_skew_ms: Optional[float]
+
+    # 2. Public trade alignment check
+    latest_trade_price: Optional[float]
+    latest_trade_ts_ms: Optional[int]
+    trade_vs_mid_bp: Optional[float]
+    trade_within_inside_spread_or_10bp: Optional[bool]
+
+    # 3. Multi-snapshot persistence / anti-spoofing stability
+    depth_10bp_usd_samples: List[float]
+    depth_25bp_usd_samples: List[float]
+    depth_10bp_cv_pct: float  # Coefficient of variation (%) across snapshots
+    depth_25bp_cv_pct: float
+    level_retention_ratio: float  # Fraction of top-50 price levels remaining present across consecutive snapshots
+    simulated_slippage_bp_samples: List[float]
+    simulated_slippage_bp_min: Optional[float]
+    simulated_slippage_bp_max: Optional[float]
+    simulated_slippage_bp_mean: Optional[float]
+
+    verdict: str
+    warnings: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)

@@ -1,5 +1,5 @@
 """
-Liquidity Analysis — Multi-Exchange Order Book & Slippage Estimation Engine.
+Liquidity Analysis — Multi-Exchange Order Book, Slippage & OTC Block Trade Comparison Engine.
 """
 
 from .models import (
@@ -26,6 +26,7 @@ from .engine import (
     compute_depth_bands,
     estimate_single,
     compare_exchanges,
+    build_otc_pitch_lines,
     verify_orderbook,
 )
 
@@ -47,5 +48,6 @@ __all__ = [
     "compute_depth_bands",
     "estimate_single",
     "compare_exchanges",
+    "build_otc_pitch_lines",
     "verify_orderbook",
 ]

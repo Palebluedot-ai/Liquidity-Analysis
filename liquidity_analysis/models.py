@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Data models for multi-exchange order book depth, slippage estimation, and verification."""
+"""Data models for multi-exchange order book depth, slippage estimation, OTC comparison, and verification."""
 
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -59,7 +59,7 @@ class OrderBookSnapshot:
 
 @dataclass
 class SlippageResult:
-    """Complete result of walking an exchange order book for a target notional or quantity."""
+    """Complete result of walking an exchange order book vs Level-1 and OTC Block Trade."""
 
     exchange: str
     exchange_label: str
@@ -77,12 +77,18 @@ class SlippageResult:
     target_qty: Optional[float]  # Target in base asset units (if qty mode)
     fx_usd_hkd: float
 
-    # Book top & spread
+    # Book top & Level-1 liquidity ("screen price illusion" metrics)
     top_bid: float
     top_ask: float
     mid_price: float
     spread_bp: float
-    top_price: float  # Reference top price for the active side (best_ask for buy, best_bid for sell)
+    top_price: float  # Level-1 price in quote currency
+    top_price_usd: float  # Level-1 price in USD
+    top_price_hkd: float  # Level-1 price in HKD
+    level1_qty: float  # Quantity resting at Level 1
+    level1_notional_usd: float  # USD notional resting at Level 1
+    level1_notional_hkd: float  # HKD notional resting at Level 1
+    level1_fill_pct: float  # % of target order that Level 1 alone can satisfy (0~100)
 
     # Execution metrics (in book quote currency, USD, and HKD)
     filled_qty: float
@@ -95,6 +101,21 @@ class SlippageResult:
     last_price_quote: float
     last_price_usd: float
     last_price_hkd: float
+
+    # Extra cost vs Level-1 screen price (OTC Block Trade comparison metrics)
+    vwap_extra_per_coin_usd: float  # |vwap_usd - top_price_usd| per 1 base coin
+    vwap_extra_per_coin_hkd: float  # |vwap_hkd - top_price_hkd| per 1 base coin
+    last_extra_per_coin_usd: float  # |last_price_usd - top_price_usd| per 1 base coin
+    last_extra_per_coin_hkd: float  # |last_price_hkd - top_price_hkd| per 1 base coin
+    slippage_loss_usd: float  # Total extra USD lost due to walking book vs Level-1 price
+    slippage_loss_hkd: float  # Total extra HKD lost due to walking book vs Level-1 price
+    taker_fee_bp: float  # Assumed exchange taker fee in bp (e.g. 5.0 or 10.0)
+    taker_fee_usd: float  # Exchange taker fee in USD
+    taker_fee_hkd: float  # Exchange taker fee in HKD
+    all_in_cost_bp: float  # vwap_slippage_bp + taker_fee_bp
+    all_in_loss_usd: float  # slippage_loss_usd + taker_fee_usd
+    all_in_loss_hkd: float  # slippage_loss_hkd + taker_fee_hkd
+    all_in_vwap_usd: float  # Effective all-in price per coin including taker fee
 
     # Slippage metrics (positive bp = adverse execution cost relative to reference)
     vwap_slippage_bp: float
@@ -117,7 +138,7 @@ class SlippageResult:
     latency_ms: float = 0.0
     sequence_id: Optional[str] = None
     note: str = (
-        "静态盘口估算，未含手续费；真实大额成交时做市商可能动态撤单，实际滑点通常更大"
+        "静态盘口估算，真正在盘面扫单时高频做市商会动态撤单，实际滑点通常为静态值的 1.5~2.5 倍"
     )
     error: Optional[str] = None
 

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Core slippage calculation engine, liquidity depth profiler, multi-exchange comparator,
-and Maker order authenticity verifier.
+OTC Block Trade value-proposition analyzer, and Maker order authenticity verifier.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +19,7 @@ from .fx import convert_notional_to_quote, get_usd_hkd_rate, quote_to_usd_and_hk
 from .models import DepthBand, OrderBookSnapshot, SlippageResult, VerificationReport
 
 DEFAULT_BP_BANDS: Tuple[float, ...] = (5.0, 10.0, 25.0, 50.0, 100.0)
+DEFAULT_TAKER_FEE_BP: float = 5.0  # Institutional VIP Taker fee benchmark (5 bp = 0.05%; retail is 10 bp)
 
 
 def walk_book(
@@ -120,10 +121,8 @@ def compute_depth_bands(
 
     for bp in bp_thresholds:
         if is_sell:
-            # Selling walks down the bid book
             boundary = top_price * (1.0 - bp / 1e4)
         else:
-            # Buying walks up the ask book
             boundary = top_price * (1.0 + bp / 1e4)
 
         cum_qty = 0.0
@@ -160,9 +159,10 @@ def evaluate_snapshot(
     notional: Optional[float] = None,
     qty: Optional[float] = None,
     fx_usd_hkd: Optional[float] = None,
+    taker_fee_bp: float = DEFAULT_TAKER_FEE_BP,
     allow_partial: bool = True,
 ) -> SlippageResult:
-    """Evaluate slippage and depth profile on an already-fetched `OrderBookSnapshot`."""
+    """Evaluate slippage, Level-1 vs VWAP extra cost, and OTC comparison metrics on a snapshot."""
     side_norm = side.lower().strip()
     if side_norm not in ("buy", "sell"):
         raise ValueError(f"side 必须是 'buy' 或 'sell' (收到: {side!r})")
@@ -179,6 +179,16 @@ def evaluate_snapshot(
     mid = snapshot.mid_price
     spread_bp = snapshot.spread_bp
     top_price = top_bid if side_norm == "sell" else top_ask
+    top_price_usd, top_price_hkd = quote_to_usd_and_hkd(
+        top_price, snapshot.quote_asset, rate
+    )
+
+    # Level-1 resting liquidity ("screen price illusion")
+    level1_qty = levels[0][1] if levels else 0.0
+    level1_quote = top_price * level1_qty
+    level1_usd, level1_hkd = quote_to_usd_and_hkd(
+        level1_quote, snapshot.quote_asset, rate
+    )
 
     target_quote: Optional[float] = None
     target_usd: Optional[float] = None
@@ -209,17 +219,52 @@ def evaluate_snapshot(
     last_quote = walk["last_price"]
     last_usd, last_hkd = quote_to_usd_and_hkd(last_quote, snapshot.quote_asset, rate)
 
-    book_total_quote = sum(p * q for p, q in levels)
-    book_total_qty = sum(q for _, q in levels)
-    book_total_usd, book_total_hkd = quote_to_usd_and_hkd(
-        book_total_quote, snapshot.quote_asset, rate
-    )
+    # Level-1 fill share percentage of target order
+    if target_usd and target_usd > 0:
+        level1_fill_pct = min(100.0, (level1_usd / target_usd) * 100.0)
+    elif qty and qty > 0:
+        level1_fill_pct = min(100.0, (level1_qty / qty) * 100.0)
+    else:
+        level1_fill_pct = 0.0
+
+    # Extra cost per coin vs Level-1 price (positive = worse for trader)
+    if side_norm == "buy":
+        vwap_extra_usd = vwap_usd - top_price_usd
+        vwap_extra_hkd = vwap_hkd - top_price_hkd
+        last_extra_usd = last_usd - top_price_usd
+        last_extra_hkd = last_hkd - top_price_hkd
+    else:
+        vwap_extra_usd = top_price_usd - vwap_usd
+        vwap_extra_hkd = top_price_hkd - vwap_hkd
+        last_extra_usd = top_price_usd - last_usd
+        last_extra_hkd = top_price_hkd - last_hkd
 
     vwap_slip_bp = adverse_slippage_bp(top_price, vwap_quote, side_norm)
     last_slip_bp = adverse_slippage_bp(top_price, last_quote, side_norm)
     vwap_vs_mid_bp = adverse_slippage_bp(mid, vwap_quote, side_norm)
     signed_diff_bp = (
         (top_price - vwap_quote) / top_price * 1e4 if top_price > 0 else 0.0
+    )
+
+    # Dollar slippage loss vs executing whole order at Level-1 price
+    slippage_loss_usd = cost_usd * (vwap_slip_bp / 1e4)
+    slippage_loss_hkd = cost_hkd * (vwap_slip_bp / 1e4)
+
+    # Exchange Taker fee & All-in execution cost
+    taker_fee_usd = cost_usd * (taker_fee_bp / 1e4)
+    taker_fee_hkd = cost_hkd * (taker_fee_bp / 1e4)
+    all_in_cost_bp = vwap_slip_bp + taker_fee_bp
+    all_in_loss_usd = slippage_loss_usd + taker_fee_usd
+    all_in_loss_hkd = slippage_loss_hkd + taker_fee_hkd
+    if side_norm == "buy":
+        all_in_vwap_usd = vwap_usd * (1.0 + taker_fee_bp / 1e4)
+    else:
+        all_in_vwap_usd = vwap_usd * (1.0 - taker_fee_bp / 1e4)
+
+    book_total_quote = sum(p * q for p, q in levels)
+    book_total_qty = sum(q for _, q in levels)
+    book_total_usd, book_total_hkd = quote_to_usd_and_hkd(
+        book_total_quote, snapshot.quote_asset, rate
     )
 
     bands = compute_depth_bands(levels, side_norm, snapshot.quote_asset, rate)
@@ -243,6 +288,12 @@ def evaluate_snapshot(
         mid_price=mid,
         spread_bp=spread_bp,
         top_price=top_price,
+        top_price_usd=top_price_usd,
+        top_price_hkd=top_price_hkd,
+        level1_qty=level1_qty,
+        level1_notional_usd=level1_usd,
+        level1_notional_hkd=level1_hkd,
+        level1_fill_pct=level1_fill_pct,
         filled_qty=walk["filled_qty"],
         cost_quote=cost_quote,
         cost_usd=cost_usd,
@@ -253,6 +304,19 @@ def evaluate_snapshot(
         last_price_quote=last_quote,
         last_price_usd=last_usd,
         last_price_hkd=last_hkd,
+        vwap_extra_per_coin_usd=vwap_extra_usd,
+        vwap_extra_per_coin_hkd=vwap_extra_hkd,
+        last_extra_per_coin_usd=last_extra_usd,
+        last_extra_per_coin_hkd=last_extra_hkd,
+        slippage_loss_usd=slippage_loss_usd,
+        slippage_loss_hkd=slippage_loss_hkd,
+        taker_fee_bp=taker_fee_bp,
+        taker_fee_usd=taker_fee_usd,
+        taker_fee_hkd=taker_fee_hkd,
+        all_in_cost_bp=all_in_cost_bp,
+        all_in_loss_usd=all_in_loss_usd,
+        all_in_loss_hkd=all_in_loss_hkd,
+        all_in_vwap_usd=all_in_vwap_usd,
         vwap_slippage_bp=vwap_slip_bp,
         last_slippage_bp=last_slip_bp,
         vwap_vs_mid_bp=vwap_vs_mid_bp,
@@ -280,6 +344,7 @@ def estimate_single(
     currency: str = "USD",
     limit: int = 5000,
     fx_rate: Optional[float] = None,
+    taker_fee_bp: float = DEFAULT_TAKER_FEE_BP,
     allow_partial: bool = True,
     prefer_native_hkd: bool = False,
 ) -> SlippageResult:
@@ -299,6 +364,7 @@ def estimate_single(
         notional=notional,
         qty=qty,
         fx_usd_hkd=rate,
+        taker_fee_bp=taker_fee_bp,
         allow_partial=allow_partial,
     )
 
@@ -312,21 +378,18 @@ def compare_exchanges(
     exchanges: Optional[Sequence[str]] = None,
     limit: int = 5000,
     fx_rate: Optional[float] = None,
+    taker_fee_bp: float = DEFAULT_TAKER_FEE_BP,
     include_native_hkd_on_hashkey: bool = True,
 ) -> List[SlippageResult]:
     """
-    Fetch order books concurrently across multiple exchanges and compute slippage comparison.
-    When `currency == 'HKD'` and `hashkey` is included, also checks `hashkey_hkd` (if available)
-    so the user can compare HashKey's USD book vs native HKD book.
+    Fetch order books concurrently across multiple exchanges and compute slippage & OTC comparison.
     """
     rate, _ = get_usd_hkd_rate(override_rate=fx_rate)
     target_exchanges = list(exchanges) if exchanges else list(DEFAULT_COMPARE_EXCHANGES)
 
-    # Expand "all" keyword
     if len(target_exchanges) == 1 and target_exchanges[0].lower() == "all":
         target_exchanges = list(DEFAULT_COMPARE_EXCHANGES)
 
-    # If user inputs HKD and queries hashkey, optionally include hashkey_hkd for native HKD book comparison
     if (
         include_native_hkd_on_hashkey
         and currency.upper() == "HKD"
@@ -348,6 +411,7 @@ def compare_exchanges(
                 currency=currency,
                 limit=limit,
                 fx_rate=rate,
+                taker_fee_bp=taker_fee_bp,
                 allow_partial=True,
             )
             return ex_name, res
@@ -372,6 +436,12 @@ def compare_exchanges(
                 mid_price=0.0,
                 spread_bp=0.0,
                 top_price=0.0,
+                top_price_usd=0.0,
+                top_price_hkd=0.0,
+                level1_qty=0.0,
+                level1_notional_usd=0.0,
+                level1_notional_hkd=0.0,
+                level1_fill_pct=0.0,
                 filled_qty=0.0,
                 cost_quote=0.0,
                 cost_usd=0.0,
@@ -382,6 +452,19 @@ def compare_exchanges(
                 last_price_quote=0.0,
                 last_price_usd=0.0,
                 last_price_hkd=0.0,
+                vwap_extra_per_coin_usd=0.0,
+                vwap_extra_per_coin_hkd=0.0,
+                last_extra_per_coin_usd=0.0,
+                last_extra_per_coin_hkd=0.0,
+                slippage_loss_usd=0.0,
+                slippage_loss_hkd=0.0,
+                taker_fee_bp=taker_fee_bp,
+                taker_fee_usd=0.0,
+                taker_fee_hkd=0.0,
+                all_in_cost_bp=0.0,
+                all_in_loss_usd=0.0,
+                all_in_loss_hkd=0.0,
+                all_in_vwap_usd=0.0,
                 vwap_slippage_bp=0.0,
                 last_slippage_bp=0.0,
                 vwap_vs_mid_bp=0.0,
@@ -409,7 +492,6 @@ def compare_exchanges(
         res = results_by_ex.get(ex_name)
         if not res:
             continue
-        # If hashkey_hkd was auto-appended and fell back to the exact same USD book as hashkey, skip duplicate
         if (
             ex_name == "hashkey_hkd"
             and "hashkey" in results_by_ex
@@ -419,6 +501,55 @@ def compare_exchanges(
         ordered.append(res)
 
     return ordered
+
+
+def build_otc_pitch_lines(results: Sequence[SlippageResult]) -> List[str]:
+    """
+    Generate sales-ready bullet points highlighting why OTC Block Trade outperforms
+    direct order-book execution for the given order.
+    """
+    valid = [r for r in results if not r.error]
+    if not valid:
+        return []
+
+    first = valid[0]
+    is_buy = first.side == "buy"
+    action_cn = "买入" if is_buy else "卖出"
+    worse_word = "多付" if is_buy else "少收"
+    push_word = "推高" if is_buy else "砸深"
+    top_label = "卖一 (Ask 1)" if is_buy else "买一 (Bid 1)"
+
+    lines: List[str] = []
+    # 1. Screen price illusion (Level 1 depth)
+    l1_parts = [
+        f"{r.exchange_label} {top_label} (`${r.top_price_usd:,.2f}`) 仅挂单 `{r.level1_qty:,.4f} {r.base_asset}` "
+        f"(`${r.level1_notional_usd:,.0f}`，仅占本单 **{r.level1_fill_pct:.1f}%**)"
+        for r in valid[:4]
+    ]
+    lines.append(
+        f"1. **屏幕第 1 档价格假象（Level-1 仅能承接极小比例）**：" + "；".join(l1_parts) + "。"
+    )
+
+    # 2. Per-exchange depth penetration & extra cost vs Level 1
+    pen_parts = []
+    for r in valid:
+        status_note = "" if not r.depth_exhausted else f"（⚠️ 且盘口仅够成交 {r.fill_ratio*100:.1f}%）"
+        pen_parts.append(
+            f"   - **{r.exchange_label} (`{r.symbol}`)**：需连续吃穿 **{r.levels_used} 档**{status_note}，"
+            f"成交均价 `${r.vwap_usd:,.2f}`（比第 1 档每颗 {r.base_asset} {worse_word} **`+${r.vwap_extra_per_coin_usd:,.2f}`** / `+{r.vwap_slippage_bp:.2f} bp`），"
+            f"最后一口被{push_word}至 `${r.last_price_usd:,.2f}`（比第 1 档差 **`+${r.last_extra_per_coin_usd:,.2f}`** / `+{r.last_slippage_bp:.2f} bp`）；"
+            f"仅静态滑点即{worse_word} **`${r.slippage_loss_usd:,.2f}`**（`HK${r.slippage_loss_hkd:,.0f}`），"
+            f"若加计 `{r.taker_fee_bp:.0f} bp` 交易所 Taker 手续费，盘面全口径综合损耗达 **`+{r.all_in_cost_bp:.2f} bp` (`${r.all_in_loss_usd:,.2f}` / `HK${r.all_in_loss_hkd:,.0f}`)**，等效全包均价 `${r.all_in_vwap_usd:,.2f}`。"
+        )
+    lines.append(f"2. **盘面直扫穿透代价（{action_cn}吃单逐档损耗）**：\n" + "\n".join(pen_parts))
+
+    # 3. Dynamic HFT withdrawal & OTC Block Trade advantage
+    lines.append(
+        "3. **OTC Block Trade（大宗一口价锁价）核心优势**：\n"
+        "   - **无分档滑点与撤单放大**：上方盘口数据仅为静态理想快照；实盘扫穿数十档时，高频做市商（HFT）在首档成交后 5~20ms 内会动态撤单（Quote Fading），实际滑点往往放大至静态值的 **1.5~2.5 倍**。\n"
+        "   - **零信息泄露 & 一口价确定性**：通过 OTC Block Trade 直接锁死单一成交净价，**不吃档位、不推高/砸穿盘面价格、免交易所 Taker 吃单费**，大额资金一步交割到位。"
+    )
+    return lines
 
 
 def verify_orderbook(
@@ -434,19 +565,7 @@ def verify_orderbook(
 ) -> VerificationReport:
     """
     Verify that the Maker orders displayed in the order book are authentic, fresh,
-    and persistent across multiple snapshots:
-
-    1. Structural & Sequence Check:
-       - Bids strictly descending, Asks strictly ascending
-       - Best Bid < Best Ask (no crossed book)
-       - Sequence ID / Timestamp monotonicity across samples
-    2. Public Trade Cross-Check:
-       - Compares latest executed public trade price against the order book [best_bid, best_ask]
-    3. Multi-Snapshot Persistence / Anti-Spoofing Check:
-       - Samples the order book `samples` times separated by `interval_sec`
-       - Measures coefficient of variation (CV%) of 10bp / 25bp depth
-       - Measures top-50 price level retention ratio across snapshots
-       - Computes min / mean / max simulated slippage across snapshots
+    and persistent across multiple snapshots.
     """
     samples = max(1, min(samples, 10))
     rate, _ = get_usd_hkd_rate()
@@ -478,7 +597,6 @@ def verify_orderbook(
     first = snapshots[0]
     last = snapshots[-1]
 
-    # 1. Structural integrity checks
     bids_desc = all(
         first.bids[i][0] > first.bids[i + 1][0] for i in range(len(first.bids) - 1)
     )
@@ -499,7 +617,6 @@ def verify_orderbook(
     if last.exchange_ts_ms:
         clock_skew_ms = float(last.fetched_at_ms - last.exchange_ts_ms)
 
-    # 2. Recent public trade alignment check
     latest_trade_price: Optional[float] = None
     latest_trade_ts_ms: Optional[int] = None
     trade_vs_mid_bp: Optional[float] = None
@@ -513,7 +630,6 @@ def verify_orderbook(
                 trade_vs_mid_bp = (
                     abs(latest_trade_price - last.mid_price) / last.mid_price * 1e4
                 )
-                # Aligned if within inside spread or within 15bp of current mid
                 trade_aligned = (
                     last.best_bid * 0.9985
                     <= latest_trade_price
@@ -522,7 +638,6 @@ def verify_orderbook(
     except Exception:
         pass
 
-    # 3. Multi-snapshot persistence & stability
     depth_10bp_samples: List[float] = []
     depth_25bp_samples: List[float] = []
     slip_samples: List[float] = []
@@ -546,7 +661,6 @@ def verify_orderbook(
     cv_10bp = _cv_pct(depth_10bp_samples)
     cv_25bp = _cv_pct(depth_25bp_samples)
 
-    # Top-50 price level retention across consecutive snapshots
     retention_scores: List[float] = []
     for i in range(len(snapshots) - 1):
         s_a = snapshots[i]

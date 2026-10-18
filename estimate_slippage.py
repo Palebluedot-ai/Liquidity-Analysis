@@ -3,20 +3,17 @@
 """
 estimate_slippage.py
 ====================
-多交易所盘口流动性分析与滑点估算工具 (Liquidity & Slippage Analyzer)
+多交易所盘口流动性分析、滑点估算与 OTC Block Trade 优势对比工具
 
-核心扩展功能:
-  1. 币对支持:
-     - 预设下拉列表币种: BTC, ETH, SOL (Solana), BNB, XRP, DOGE, SUI, AVAX, LINK, HSK 等
-     - 自定义输入: 支持任意币种简称/全称或交易对 (如 Solana, PEPE, BTCUSDT, BTC/USD, BTCHKD)
-  2. 购买/卖出金额支持美金 (USD) 或港币 (HKD):
-     - 自动拉取实时 USD/HKD 汇率换算，同时输出 USD 与 HKD 计价的 VWAP 与成本
-     - 支持 15000000、15M、500k、1000万 等人性化金额输入
-  3. 多交易所实时 L2 盘口支持:
-     - Binance, OKX, Coinbase, Kraken, HashKey HK (USD & HKD 盘口), HashKey Global, Bybit
-     - 支持单所测算或多所并发横向对比 (--exchange all)
-  4. 盘口 Maker 单真实性验证 (--verify):
-     - 盘口结构与序列号单调性校验 + 最新公开逐笔成交价交叉比对 + 多帧采样深度留存率/防闪单检测
+核心功能:
+  1. 币对支持: 预设下拉菜单 (BTC, ETH, Solana/SOL 等) + 任意自定义币对输入
+  2. 金额支持: 美金 (USD) 或港币 (HKD)，支持 1000000 / 1M / 100万 / 1000万 等简写
+  3. 交易所支持: Binance, OKX, Coinbase, Kraken, HashKey HK (USD & HKD), HashKey Global, Bybit
+  4. OTC Block Trade 专项对比分析:
+     - 揭露「第 1 档屏幕价假象」: 展示第 1 档挂单金额及仅占目标订单的百分比
+     - 穿透档数: 展示吃掉多少档 (`levels_used`)
+     - 额外价差: 展示平均成交价 (VWAP) 与最后一口价相对第 1 档每颗币额外多付多少美金/港币 (`+$XX.XX/币`)
+     - 全口径损耗: 汇总静态滑点损失金额 + 交易所 Taker 吃单费，自动生成面向客户的 OTC 对比话术
 """
 
 import argparse
@@ -25,6 +22,8 @@ import sys
 from typing import List, Optional
 
 from liquidity_analysis.engine import (
+    DEFAULT_TAKER_FEE_BP,
+    build_otc_pitch_lines,
     compare_exchanges,
     estimate_single,
     verify_orderbook,
@@ -67,6 +66,7 @@ def demo_screenshot():
 
 def _print_single_result(r: SlippageResult) -> None:
     ccy = r.input_currency
+    worse_word = "多付" if r.side == "buy" else "少收"
     if r.target_notional_input is not None:
         prefix = "HK$" if ccy == "HKD" else "$"
         target_txt = (
@@ -80,11 +80,10 @@ def _print_single_result(r: SlippageResult) -> None:
         f"交易所: {r.exchange_label} ({r.exchange})  交易对: {r.symbol}  "
         f"方向: {r.side.upper()}  目标: {target_txt}"
     )
-    if ccy == "HKD" or r.quote_asset == "HKD":
-        print(f"参考汇率: 1 USD = {r.fx_usd_hkd:.4f} HKD")
     print(
-        f"盘口最优价(top): {r.top_price:,.2f} {r.quote_asset} "
-        f"(买一 {r.top_bid:,.2f} / 卖一 {r.top_ask:,.2f}, 价差 {r.spread_bp:.2f} bp)"
+        f"第 1 档最优价(top): ${r.top_price_usd:,.2f} USD (HK${r.top_price_hkd:,.2f} HKD) | "
+        f"第 1 档仅挂单: {r.level1_qty:,.4f} {r.base_asset} (${r.level1_notional_usd:,.0f} USD, "
+        f"仅够满足本单 {r.level1_fill_pct:.1f}%)"
     )
     print(
         f"同侧盘口总额: ${r.book_side_total_usd:,.0f} USD / HK${r.book_side_total_hkd:,.0f} HKD "
@@ -95,18 +94,25 @@ def _print_single_result(r: SlippageResult) -> None:
         if not r.depth_exhausted
         else f"⚠️ 盘口深度耗尽 (仅成交 {r.fill_ratio * 100:.2f}%)"
     )
-    print(f"吃掉档位数: {r.levels_used} ({status_str})")
+    print(f"吃掉档位数: {r.levels_used} 档 ({status_str})")
     print(
         f"实际成交: {r.filled_qty:,.4f} {r.base_asset} / "
         f"${r.cost_usd:,.2f} USD (HK${r.cost_hkd:,.2f} HKD)"
     )
     print(
-        f"VWAP: ${r.vwap_usd:,.2f} USD (HK${r.vwap_hkd:,.2f} HKD)  "
-        f"→ 不利滑点 {r.vwap_slippage_bp:.2f} bp (相对 mid {r.vwap_vs_mid_bp:.2f} bp)"
+        f"成交均价 VWAP: ${r.vwap_usd:,.2f} USD (HK${r.vwap_hkd:,.2f} HKD)  "
+        f"→ 比第 1 档每颗 {r.base_asset} 额外{worse_word} +${r.vwap_extra_per_coin_usd:,.2f} "
+        f"(+HK${r.vwap_extra_per_coin_hkd:,.2f}, 滑点 +{r.vwap_slippage_bp:.2f} bp)"
     )
     print(
-        f"最后一口: ${r.last_price_usd:,.2f} USD (HK${r.last_price_hkd:,.2f} HKD)  "
-        f"→ 不利滑点 {r.last_slippage_bp:.2f} bp"
+        f"最后一口成交价: ${r.last_price_usd:,.2f} USD (HK${r.last_price_hkd:,.2f} HKD)  "
+        f"→ 比第 1 档每颗 {r.base_asset} 额外{worse_word} +${r.last_extra_per_coin_usd:,.2f} "
+        f"(+HK${r.last_extra_per_coin_hkd:,.2f}, 滑点 +{r.last_slippage_bp:.2f} bp)"
+    )
+    print(
+        f"盘面直扫额外损耗: 仅滑点{worse_word} ${r.slippage_loss_usd:,.2f} USD (HK${r.slippage_loss_hkd:,.0f} HKD) | "
+        f"含 {r.taker_fee_bp:.0f}bp Taker 费全口径{worse_word} ${r.all_in_loss_usd:,.2f} USD "
+        f"(+{r.all_in_cost_bp:.2f} bp, 等效全包均价 ${r.all_in_vwap_usd:,.2f})"
     )
     if r.depth_bands:
         bands_str = " | ".join(
@@ -114,7 +120,9 @@ def _print_single_result(r: SlippageResult) -> None:
             for b in r.depth_bands
         )
         print(f"盘口深度阶梯: {bands_str}")
-    print(f"注意: {r.note}")
+    print("\n--- 💡 OTC Block Trade 对比话术 ---")
+    for line in build_otc_pitch_lines([r]):
+        print(line)
 
 
 def _print_comparison_table(results: List[SlippageResult]) -> None:
@@ -133,59 +141,49 @@ def _print_comparison_table(results: List[SlippageResult]) -> None:
     else:
         target_txt = f"{first.target_qty:,.4f} {first.base_asset}"
 
-    print("=" * 112)
+    print("=" * 136)
     print(
-        f"跨交易所流动性与滑点对比 | 标的: {first.base_asset} | 方向: {first.side.upper()} | "
+        f"📊 盘面直扫 vs OTC Block Trade 穿透对比 | 标的: {first.base_asset} | 方向: {first.side.upper()} | "
         f"目标: {target_txt} | 汇率: {first.fx_usd_hkd:.4f} HKD/USD"
     )
-    print("=" * 112)
+    print("=" * 136)
     header = (
-        f"{'交易所':<22} {'交易对':<10} {'最优价(USD)':>13} {'VWAP(USD)':>13} "
-        f"{'VWAP(HKD)':>14} {'VWAP滑点':>10} {'尾档滑点':>10} {'同侧总深(USD)':>15} {'状态':<12}"
+        f"{'交易所':<18} {'交易对':<9} {'1档价(USD)':>12} {'1档仅够%':>8} "
+        f"{'吃穿档数':>8} {'VWAP均价(USD)':>14} {'每币比1档贵':>14} "
+        f"{'尾档比1档贵':>14} {'仅滑点多花':>12} {'含费全口径损耗':>16}"
     )
     print(header)
-    print("-" * 112)
+    print("-" * 136)
 
     for r in results:
         if r.error:
             print(
-                f"{r.exchange_label:<22} {r.symbol:<10} {'-':>13} {'-':>13} "
-                f"{'-':>14} {'-':>10} {'-':>10} {'-':>15} ❌ {r.error[:30]}"
+                f"{r.exchange_label:<18} {r.symbol:<9} {'-':>12} {'-':>8} "
+                f"{'-':>8} {'-':>14} {'-':>14} {'-':>14} {'-':>12} ❌ {r.error[:24]}"
             )
             continue
-        top_usd = r.top_price / r.fx_usd_hkd if r.quote_asset == "HKD" else r.top_price
-        status = (
-            f"100% ({r.levels_used}档)"
+        lvl_txt = (
+            f"{r.levels_used}档"
             if not r.depth_exhausted
-            else f"⚠️ {r.fill_ratio * 100:.1f}% (耗尽)"
+            else f"{r.levels_used}档(耗尽)"
         )
+        vwap_extra_txt = f"+${r.vwap_extra_per_coin_usd:,.2f} ({r.vwap_slippage_bp:.1f}bp)"
+        last_extra_txt = f"+${r.last_extra_per_coin_usd:,.2f} ({r.last_slippage_bp:.1f}bp)"
+        all_in_txt = f"${r.all_in_loss_usd:,.0f} (+{r.all_in_cost_bp:.1f}bp)"
         print(
-            f"{r.exchange_label:<22} {r.symbol:<10} "
-            f"${top_usd:>12,.2f} ${r.vwap_usd:>12,.2f} "
-            f"HK${r.vwap_hkd:>11,.2f} {r.vwap_slippage_bp:>7.2f} bp "
-            f"{r.last_slippage_bp:>7.2f} bp ${r.book_side_total_usd:>14,.0f} {status:<12}"
+            f"{r.exchange_label:<18} {r.symbol:<9} "
+            f"${r.top_price_usd:>11,.2f} {r.level1_fill_pct:>7.1f}% "
+            f"{lvl_txt:>8} ${r.vwap_usd:>13,.2f} {vwap_extra_txt:>14} "
+            f"{last_extra_txt:>14} ${r.slippage_loss_usd:>11,.2f} {all_in_txt:>16}"
         )
 
-    print("-" * 112)
-    full_fills = [r for r in results if not r.error and not r.depth_exhausted]
-    if full_fills:
-        best_slip = min(full_fills, key=lambda x: x.vwap_slippage_bp)
-        best_px = (
-            min(full_fills, key=lambda x: x.vwap_usd)
-            if first.side == "buy"
-            else max(full_fills, key=lambda x: x.vwap_usd)
-        )
-        print(
-            f"🏆 最小盘口冲击: {best_slip.exchange_label} ({best_slip.symbol}) — "
-            f"VWAP 滑点 {best_slip.vwap_slippage_bp:.2f} bp "
-            f"(均价 ${best_slip.vwap_usd:,.2f} USD / HK${best_slip.vwap_hkd:,.2f} HKD)"
-        )
-        print(
-            f"💰 最优绝对均价: {best_px.exchange_label} ({best_px.symbol}) — "
-            f"成交均价 ${best_px.vwap_usd:,.2f} USD / HK${best_px.vwap_hkd:,.2f} HKD "
-            f"(盘口滑点 {best_px.vwap_slippage_bp:.2f} bp)"
-        )
-    print(f"注: {first.note}")
+    print("-" * 136)
+    pitch_lines = build_otc_pitch_lines(results)
+    if pitch_lines:
+        print("💡 【OTC Block Trade 客户对比分析结论（可直接复制发送）】")
+        for line in pitch_lines:
+            print(line)
+    print("=" * 136)
 
 
 def _print_verification_report(rep: VerificationReport) -> None:
@@ -195,7 +193,7 @@ def _print_verification_report(rep: VerificationReport) -> None:
         f"采样 {rep.samples_count} 次 (间隔 {rep.interval_sec}s)"
     )
     print("=" * 90)
-    print(f"1. 盘口结构完整性:")
+    print("1. 盘口结构完整性:")
     print(
         f"   - 买一 / 卖一 : {rep.best_bid:,.2f} / {rep.best_ask:,.2f} "
         f"(Spread: {rep.spread_bp:.2f} bp, 是否倒挂: {'否 ✅' if not rep.is_crossed else '是 ❌'})"
@@ -207,7 +205,7 @@ def _print_verification_report(rep: VerificationReport) -> None:
     print(
         f"   - 序列号单调性: {rep.sequence_ids} ({'单调递增/正常 ✅' if rep.sequence_monotonic else '异常 ❌'})"
     )
-    print(f"2. 最新公开成交 (Public Trades) 交叉核验:")
+    print("2. 最新公开成交 (Public Trades) 交叉核验:")
     if rep.latest_trade_price is not None:
         print(
             f"   - 最新逐笔成交价: {rep.latest_trade_price:,.2f} "
@@ -216,7 +214,7 @@ def _print_verification_report(rep: VerificationReport) -> None:
         )
     else:
         print("   - 最新逐笔成交价: 暂未获取")
-    print(f"3. 多帧盘口留存率与防闪单 (Anti-Spoofing) 检测:")
+    print("3. 多帧盘口留存率与防闪单 (Anti-Spoofing) 检测:")
     print(
         f"   - 前 50 档价格留存率: {rep.level_retention_ratio * 100:.1f}% "
         f"(连续两次快照之间相同价格档位的保留比例)"
@@ -243,7 +241,7 @@ def _print_verification_report(rep: VerificationReport) -> None:
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
-        description="多交易所现货盘口流动性与滑点估算工具 (支持 USD/HKD、预设与自定义币对、多所对比、盘口真伪验证)"
+        description="多交易所现货盘口流动性、滑点估算与 OTC Block Trade 对比分析工具"
     )
     ap.add_argument(
         "--symbol",
@@ -260,7 +258,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--notional",
         type=str,
         default=None,
-        help="目标名义金额 (支持数字或 15M / 500k / 1000万), 与 --qty 二选一",
+        help="目标名义金额 (支持数字或 1M / 500k / 100万 / 1000万), 与 --qty 二选一",
     )
     ap.add_argument(
         "--qty",
@@ -279,8 +277,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         default="binance",
         help=(
             "交易所: binance, okx, coinbase, kraken, hashkey, hashkey_hkd, "
-            "hashkey_global, bybit, 或 all (多所横向对比), 也支持逗号分隔如 binance,okx,hashkey。默认 binance"
+            "hashkey_global, bybit, 或 all (多所横向对比), 也支持逗号分隔如 binance,okx。默认 binance"
         ),
+    )
+    ap.add_argument(
+        "--taker-fee-bp",
+        type=float,
+        default=DEFAULT_TAKER_FEE_BP,
+        help=f"盘面 Taker 吃单手续费率 (bp), 用于计算全口径盘面成本, 默认 {DEFAULT_TAKER_FEE_BP} bp",
     )
     ap.add_argument(
         "--fx-rate",
@@ -396,6 +400,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             exchanges=ex_list,
             limit=args.limit,
             fx_rate=args.fx_rate,
+            taker_fee_bp=args.taker_fee_bp,
         )
         if args.lark_card == "result":
             print(json.dumps(build_result_card(results), indent=2, ensure_ascii=False))
@@ -403,7 +408,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.json:
             print(
                 json.dumps(
-                    [r.to_dict() for r in results], indent=2, ensure_ascii=False
+                    {
+                        "results": [r.to_dict() for r in results],
+                        "otc_pitch": build_otc_pitch_lines(results),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
                 )
             )
         else:
@@ -421,6 +431,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             currency=args.currency.upper(),
             limit=args.limit,
             fx_rate=args.fx_rate,
+            taker_fee_bp=args.taker_fee_bp,
             allow_partial=False,
         )
     except RuntimeError as e:
@@ -428,8 +439,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     if args.json:
-        # Include legacy keys (`target_usd`, `cost_usd`, `vwap`, `last_price`, `vwap_vs_top_bp`, `last_vs_top_bp`)
-        # alongside the expanded multi-currency fields
         payload = r.to_dict()
         payload.update(
             {
@@ -438,6 +447,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "last_price": r.last_price_quote,
                 "vwap_vs_top_bp": r.vwap_slippage_bp,
                 "last_vs_top_bp": r.last_slippage_bp,
+                "otc_pitch": build_otc_pitch_lines([r]),
             }
         )
         print(json.dumps(payload, indent=2, ensure_ascii=False))

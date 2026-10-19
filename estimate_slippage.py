@@ -22,6 +22,10 @@ from liquidity_analysis.exchanges import (
     DEFAULT_COMPARE_EXCHANGES,
     SUPPORTED_EXCHANGES,
 )
+from liquidity_analysis.historical_tracker import (
+    load_historical_dataset,
+    refresh_historical_dataset,
+)
 from liquidity_analysis.lark_card import build_query_card, build_result_card
 from liquidity_analysis.models import SlippageResult, VerificationReport
 from liquidity_analysis.symbols import PRESET_ASSETS, parse_amount
@@ -276,8 +280,54 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=None,
         help="输出飞书 (Lark) 交互卡片 JSON (query=查询表单卡片, result=测算结果卡片)",
     )
+    ap.add_argument(
+        "--backtest-1y",
+        action="store_true",
+        help="输出过去 365 天（1整年）五大交易所 4 大市场场景真实大单历史冲击与案例库",
+    )
+    ap.add_argument(
+        "--refresh-1y",
+        action="store_true",
+        help="通过五大交易所公开 API 重新分页拉取过去 365 天历史 K 线与逐笔成交并更新本地 1 年期基准库",
+    )
 
     args = ap.parse_args(argv)
+
+    if args.refresh_1y or args.backtest_1y:
+        ds = refresh_historical_dataset(365) if args.refresh_1y else load_historical_dataset()
+        if not ds:
+            ds = refresh_historical_dataset(365)
+        if args.json:
+            print(json.dumps(ds, indent=2, ensure_ascii=False))
+            return 0
+        print("=" * 110)
+        print(
+            f"📊 五大交易所 {ds.get('horizon_days', 365)} 天 ({ds.get('window_start_utc')} ~ {ds.get('window_end_utc')}) "
+            f"真实大单 4 大场景历史冲击与取证库"
+        )
+        print("=" * 110)
+        for ex_k, ex_v in ds.get("exchanges", {}).items():
+            if ex_k == "hashkey_hk":
+                continue
+            print(
+                f"\n>>> {ex_v['label']} | API: {ex_v['api_method']} | "
+                f"Span: {ex_v['span_start_utc']} -> {ex_v['span_end_utc']} | "
+                f"Stage2高频样本: {ex_v['stage2_high_freq_bars']} 根 ({ex_v['high_freq_interval']})"
+            )
+            for s_key, s_obj in ex_v.get("scenarios", {}).items():
+                if s_obj.get("count", 0) <= 0:
+                    continue
+                print(
+                    f"  • {s_key:<18} | N={s_obj['count']:<4} | 平均净大单=${s_obj['avg_net_flow_usd']/1e6:.2f}M | "
+                    f"中位峰值冲击={s_obj['median_peak_bp']:>5.1f}bp | P75={s_obj['p75_peak_bp']:>5.1f}bp | "
+                    f"P90={s_obj['p90_peak_bp']:>5.1f}bp | 永久留存={int(s_obj['perm_retention_ratio']*100)}%"
+                )
+                for c in s_obj.get("top_cases", [])[:2]:
+                    print(
+                        f"      - [{c['dt']}] {c['dir']} 净额=${c['abs_net_usd']/1e6:.2f}M (总成交=${c['quote_vol_usd']/1e6:.2f}M): "
+                        f"${c['open']:,.1f} -> 瞬间冲击 {c['peak_bp']:.1f}bp / 收盘永久位移 {c['perm_bp']:.1f}bp (前序趋势={c['prior_ret_bp']:+.1f}bp)"
+                    )
+        return 0
 
     if args.list_presets:
         info = {

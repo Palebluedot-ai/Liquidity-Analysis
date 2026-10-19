@@ -48,6 +48,68 @@ class FadeScenario:
 
 
 @dataclass
+class HistoricalCaseRecord:
+    """A real, timestamp-verifiable historical large-order event on an exchange."""
+
+    dt: str
+    dir: str  # "BUY" or "SELL"
+    open: float
+    high: float
+    low: float
+    close: float
+    abs_net_usd: float
+    quote_vol_usd: float
+    peak_bp: float
+    perm_bp: float
+    prior_ret_bp: float
+
+
+@dataclass
+class ScenarioExecutionEstimate:
+    """
+    Empirical 365-day historical execution cost benchmark scaled to the user's target order
+    under one of the 4 distinct market regimes:
+      - normal_calm      (① 正常平稳震荡期)
+      - momentum_chase   (② 上涨追高 / 顺势突破抢筹期)
+      - extreme_stampede (③ 极端踩踏 / 恐慌清算真空期)
+      - contrarian_dip   (④ 逆势抄底 / 逢高派发期)
+    """
+
+    scenario_key: str
+    scenario_label: str
+    sample_count: int
+    hist_avg_net_usd: float
+    hist_median_peak_bp: float
+    hist_p75_peak_bp: float
+    hist_p90_peak_bp: float
+    hist_perm_retention: float
+    # Scaled to user's target order size Q + exchange Taker fee + fiat/USDT friction
+    est_impact_median_bp: float
+    est_impact_p90_bp: float
+    est_all_in_median_bp: float
+    est_all_in_p90_bp: float
+    otc_savings_median_bp: float  # est_all_in_median_bp - otc_quote_bp
+    otc_savings_p90_bp: float     # est_all_in_p90_bp - otc_quote_bp
+    representative_cases: List[HistoricalCaseRecord] = field(default_factory=list)
+
+
+@dataclass
+class HistoricalScenarioMatrix:
+    """Full 365-day (1-Year) 4-Scenario historical event study & order impact matrix for an exchange."""
+
+    exchange: str
+    exchange_label: str
+    horizon_days: int
+    span_start_utc: str
+    span_end_utc: str
+    stage1_macro_bars: int
+    stage2_high_freq_bars: int
+    high_freq_interval: str
+    api_method: str
+    scenarios: List[ScenarioExecutionEstimate] = field(default_factory=list)
+
+
+@dataclass
 class RealExecutionBreakdown:
     """
     Full-chain realistic order-book execution cost breakdown vs. OTC Block Trade quote.
@@ -113,6 +175,7 @@ class RealExecutionBreakdown:
     strategy_optimal_bp: float = 0.0
     strategy_slow_twap_bp: float = 0.0
     data_source_note: str = "live_kline_and_l2_calibration"
+    historical_matrix: Optional[HistoricalScenarioMatrix] = None
 
 
 @dataclass

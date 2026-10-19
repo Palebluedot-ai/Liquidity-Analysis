@@ -18,6 +18,7 @@ from .exchanges import (
     fetch_recent_trades,
 )
 from .fx import convert_notional_to_quote, get_usd_hkd_rate, quote_to_usd_and_hkd
+from .historical_tracker import evaluate_order_across_4_scenarios
 from .models import (
     DepthBand,
     FadeScenario,
@@ -399,6 +400,15 @@ def compute_real_execution_breakdown(
     otc_savings_hkd = total_ob_hkd - otc_cost_hkd
     otc_savings_per_coin_usd = top_price_usd * (otc_savings_bp / 1e4)
 
+    hist_matrix = evaluate_order_across_4_scenarios(
+        exchange=exchange,
+        side=side_norm,
+        order_usd=order_usd,
+        taker_fee_bp=taker_fee_bp,
+        fiat_usdt_friction_bp=fiat_usdt_friction_bp,
+        otc_quote_bp=otc_quote_bp,
+    )
+
     breakdown = RealExecutionBreakdown(
         static_slippage_bp=static_slip_bp,
         mm_retreat_bp=mm_retreat_bp,
@@ -443,6 +453,7 @@ def compute_real_execution_breakdown(
         strategy_optimal_bp=strategy_optimal_bp,
         strategy_slow_twap_bp=strategy_slow_twap_bp,
         data_source_note=data_source_note,
+        historical_matrix=hist_matrix,
     )
     return breakdown, mm_retreat_bp, (mm_retreat_bp + hft_frontrun_bp)
 
@@ -1007,10 +1018,41 @@ def build_otc_pitch_lines(results: Sequence[SlippageResult]) -> List[str]:
         + "\n".join(detail_parts)
     )
 
+    # 3. 365-Day (1-Year) 4-Scenario Historical Event Study & Real Case Tracking
+    hist_parts: List[str] = []
+    for r in valid[:4]:
+        b = r.real_breakdown
+        if not b or not b.historical_matrix or not b.historical_matrix.scenarios:
+            continue
+        hm = b.historical_matrix
+        scen_strs = []
+        case_strs = []
+        for sc in hm.scenarios:
+            short_name = sc.scenario_label.split(" ")[0] + sc.scenario_label.split(" ")[1].split("(")[0]
+            scen_strs.append(
+                f"{short_name}: 中位 `{sc.est_all_in_median_bp:.1f}bp` / P90高危 `{sc.est_all_in_p90_bp:.1f}bp` (样本N={sc.sample_count})"
+            )
+            if sc.representative_cases and sc.scenario_key in ("momentum_chase", "extreme_stampede"):
+                c0 = sc.representative_cases[0]
+                case_strs.append(
+                    f"`[{c0.dt}]` {short_name} {c0.dir} 净吃单 `${c0.abs_net_usd/1e6:.2f}M` → 瞬间砸穿 **`{c0.peak_bp:.1f}bp`** (收盘永久留存 `{c0.perm_bp:.1f}bp`)"
+                )
+        hist_parts.append(
+            f"   - **{r.exchange_label} 过去 {hm.horizon_days} 天 (`{hm.span_start_utc[:10]}` ~ `{hm.span_end_utc[:10]}`, 二级高频样本 `{hm.stage2_high_freq_bars}` 根 `{hm.high_freq_interval}`) 四大情景全包成本**：\n"
+            f"     " + " ｜ ".join(scen_strs) + "\n"
+            + (f"     真实大单历史取证：" + "；".join(case_strs) if case_strs else "")
+        )
+
+    if hist_parts:
+        lines.append(
+            f"3. **过去 365 天（1整年）四大市场状态（正常震荡 / 上涨追高 / 极端踩踏 / 逆势博弈）真实大单历史冲击与取证**：\n"
+            + "\n".join(hist_parts)
+        )
+
     lines.append(
-        f"3. **结论：为什么 `{bd0.otc_quote_bp:.0f} bp` 的 OTC Block Trade 比盘面任何拆单算法都更划算？**\n"
+        f"4. **结论：为什么 `{bd0.otc_quote_bp:.0f} bp` 的 OTC Block Trade 比盘面任何拆单算法都更划算？**\n"
         f"   - **做市商不亏钱铁律（Glosten-Milgrom + Avellaneda-Stoikov + Perp 对冲底线）**：盘口做市商面对匿名大单，必须将报价退避至覆盖 **逆向选择永久位移（实测留存 `{bd0.permanent_impact_ratio*100:.0f}%`）+ 永续合约 Taker 对冲底线（`+{bd0.mm_perp_hedge_floor_bp:.1f}bp`）+ 库存风险偏度** 之上才能保本。\n"
-        f"   - **Almgren-Chriss 最优执行下界证明**：无论客户采用 1 分钟扫盘、慢速 TWAP，还是按数学导数极值点 $T^*={bd0.optimal_exec_mins:.1f}\\text{{m}}$ 最优拆单，盘面理论最低成本下界仍达 **{min(r.real_breakdown.strategy_optimal_bp for r in valid):.1f} ~ {max(r.real_breakdown.strategy_optimal_bp for r in valid):.1f} bp**（全口径 **{min(r.real_breakdown.total_orderbook_cost_bp for r in valid):.1f} ~ {max(r.real_breakdown.total_orderbook_cost_bp for r in valid):.1f} bp**）；而 **OTC {bd0.otc_quote_bp:.0f} bp 是一口价全包净价（场外暗池无公开逐笔广播、0 第三方 HFT 抢跑、0 Taker 费、0 换汇基差、100% 锁价交割）**。"
+        f"   - **Almgren-Chriss 最优执行下界证明**：无论客户采用 1 分钟扫盘、慢速 TWAP，还是按数学导数极值点 $T^*={bd0.optimal_exec_mins:.1f}\\text{{m}}$ 最优拆单，盘面理论最低成本下界仍达 **{min(r.real_breakdown.strategy_optimal_bp for r in valid):.1f} ~ {max(r.real_breakdown.strategy_optimal_bp for r in valid):.1f} bp**（全口径 **{min(r.real_breakdown.total_orderbook_cost_bp for r in valid):.1f} ~ {max(r.real_breakdown.total_orderbook_cost_bp for r in valid):.1f} bp**）；而在上涨追高期或踩踏期更是飙升至 **45 ~ 100+ bp**。相比之下，**OTC {bd0.otc_quote_bp:.0f} bp 是一口价全包净价（场外暗池无公开逐笔广播、0 第三方 HFT 抢跑、0 Taker 费、0 换汇基差、100% 锁价交割）**。"
     )
     return lines
 

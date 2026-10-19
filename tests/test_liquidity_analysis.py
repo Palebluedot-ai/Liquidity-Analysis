@@ -127,7 +127,7 @@ class TestLiquidityAnalysis(unittest.TestCase):
         self.assertAlmostEqual(res.taker_fee_usd, 500.0)
 
         pitch = build_otc_pitch_lines([res])
-        self.assertEqual(len(pitch), 3)
+        self.assertGreaterEqual(len(pitch), 3)
 
         # Verify Lark Card Schema 2.0
         q_card = build_query_card()
@@ -153,6 +153,40 @@ class TestLiquidityAnalysis(unittest.TestCase):
         self.assertEqual(params["symbol"], "BTC")
         self.assertEqual(params["notional"], 1_000_000.0)
         self.assertEqual(params["exchanges"], ["binance", "okx"])
+
+    def test_historical_tracker_4_scenarios(self):
+        from liquidity_analysis.historical_tracker import (
+            evaluate_order_across_4_scenarios,
+            load_historical_dataset,
+        )
+
+        ds = load_historical_dataset()
+        self.assertIsNotNone(ds)
+        self.assertEqual(ds["horizon_days"], 365)
+        for ex in ("binance", "okx", "coinbase", "kraken", "hashkey_global"):
+            self.assertIn(ex, ds["exchanges"])
+            mat = evaluate_order_across_4_scenarios(
+                exchange=ex,
+                side="buy",
+                order_usd=2_000_000.0,
+                taker_fee_bp=10.0,
+                fiat_usdt_friction_bp=11.0,
+                otc_quote_bp=30.0,
+            )
+            self.assertIsNotNone(mat)
+            self.assertEqual(len(mat.scenarios), 4)
+            scen_keys = [s.scenario_key for s in mat.scenarios]
+            self.assertEqual(
+                scen_keys,
+                ["normal_calm", "momentum_chase", "extreme_stampede", "contrarian_dip"],
+            )
+            # Verify that momentum_chase and extreme_stampede have higher impact than normal_calm
+            normal_bp = mat.scenarios[0].est_all_in_median_bp
+            chase_bp = mat.scenarios[1].est_all_in_median_bp
+            stampede_bp = mat.scenarios[2].est_all_in_median_bp
+            self.assertGreaterEqual(chase_bp, normal_bp)
+            self.assertGreater(stampede_bp, normal_bp)
+            self.assertGreater(len(mat.scenarios[1].representative_cases), 0)
 
 
 if __name__ == "__main__":

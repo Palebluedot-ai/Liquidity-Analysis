@@ -425,8 +425,9 @@ def build_verification_card(rep: VerificationReport) -> Dict[str, Any]:
 
     lines.extend(
         [
-            "\n#### 3. 多帧盘口留存率与防闪单 (Anti-Spoofing) 检测",
+            "\n#### 3. 多帧盘口留存率与防闪单 (Anti-Spoofing / 撤单成交比取证) 检测",
             f"- **前 50 档价格留存率**：**`{rep.level_retention_ratio * 100:.1f}%`** (连续快照间相同价格档位的存活率)",
+            f"- **10bp 内消失挂单 vs 真实成交取证**：消失 **`${rep.vanished_10bp_usd:,.0f}`** ｜ 真实成交 **`${rep.traded_10bp_usd:,.0f}`** ｜ **实锤主动撤单 `${rep.cancelled_10bp_usd:,.0f}` (`{rep.cancel_share_pct:.1f}%`，撤单/成交比 `{rep.cancel_to_fill_ratio:.1f}:1`)**",
             f"- **10bp 内挂单深度波动率 (CV)**：`{rep.depth_10bp_cv_pct:.2f}%` ｜ 样本(USD): `{[round(x, 0) for x in rep.depth_10bp_usd_samples]}`",
             f"- **25bp 内挂单深度波动率 (CV)**：`{rep.depth_25bp_cv_pct:.2f}%` ｜ 样本(USD): `{[round(x, 0) for x in rep.depth_25bp_usd_samples]}`",
         ]

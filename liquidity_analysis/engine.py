@@ -1084,11 +1084,12 @@ def verify_orderbook(
     latest_trade_ts_ms: Optional[int] = None
     trade_vs_mid_bp: Optional[float] = None
     trade_aligned: Optional[bool] = None
+    trades_list: List[Dict[str, Any]] = []
     try:
-        trades = fetch_recent_trades(first.exchange, first.symbol, limit=5)
-        if trades:
-            latest_trade_price = trades[0]["price"]
-            latest_trade_ts_ms = trades[0].get("ts_ms")
+        trades_list = fetch_recent_trades(first.exchange, first.symbol, limit=250)
+        if trades_list:
+            latest_trade_price = trades_list[0]["price"]
+            latest_trade_ts_ms = trades_list[0].get("ts_ms")
             if last.mid_price > 0 and latest_trade_price > 0:
                 trade_vs_mid_bp = (
                     abs(latest_trade_price - last.mid_price) / last.mid_price * 1e4
@@ -1100,6 +1101,50 @@ def verify_orderbook(
                 )
     except Exception:
         pass
+
+    # Forensic Cancel-to-Fill Ratio (CFR): compare vanished L2 depth within 10bp vs actual trades in [t_first, t_last]
+    div_ccy = rate if first.quote_asset.upper() == "HKD" else 1.0
+    is_sell_side = side.lower() == "sell"
+    p0_first = first.best_bid if is_sell_side else first.best_ask
+    bound_10_first = p0_first * 0.9990 if is_sell_side else p0_first * 1.0010
+    lv_first = first.bids if is_sell_side else first.asks
+    lv_last = last.bids if is_sell_side else last.asks
+
+    map_first = {
+        round(p, 6): q
+        for p, q in lv_first
+        if (p >= bound_10_first if is_sell_side else p <= bound_10_first)
+    }
+    map_last = {round(p, 6): q for p, q in lv_last}
+
+    vanished_10bp_usd = 0.0
+    for p, q1 in map_first.items():
+        q2 = map_last.get(p, 0.0)
+        if q2 < q1:
+            vanished_10bp_usd += ((q1 - q2) * p) / div_ccy
+
+    traded_10bp_usd = 0.0
+    t_start_ms = first.fetched_at_ms - 500
+    t_end_ms = last.fetched_at_ms + 500
+    for tr in trades_list:
+        ts = tr.get("ts_ms")
+        if ts is None or (t_start_ms <= ts <= t_end_ms):
+            tp = tr["price"]
+            in_band = (
+                (bound_10_first <= tp <= p0_first * 1.001)
+                if is_sell_side
+                else (p0_first * 0.999 <= tp <= bound_10_first)
+            )
+            if in_band:
+                traded_10bp_usd += (tp * tr["qty"]) / div_ccy
+
+    cancelled_10bp_usd = max(0.0, vanished_10bp_usd - traded_10bp_usd)
+    cancel_share_pct = (
+        (cancelled_10bp_usd / vanished_10bp_usd * 100.0)
+        if vanished_10bp_usd > 0
+        else 0.0
+    )
+    cancel_to_fill_ratio = cancelled_10bp_usd / max(1.0, traded_10bp_usd)
 
     depth_10bp_samples: List[float] = []
     depth_25bp_samples: List[float] = []
@@ -1153,6 +1198,10 @@ def verify_orderbook(
         warnings.append(
             f"25bp 内挂单深度在采样期间波动较大 (CV={cv_25bp:.1f}%)，存在高频闪单/撤单现象"
         )
+    if cancel_share_pct >= 60.0 and cancelled_10bp_usd >= 50_000:
+        warnings.append(
+            f"实锤高频撤单：采样期间 10bp 内消失挂单 ${vanished_10bp_usd:,.0f}，其中 {cancel_share_pct:.1f}% (${cancelled_10bp_usd:,.0f}) 系做市商主动撤单而非真实成交 (撤单/成交比 {cancel_to_fill_ratio:.1f}:1)"
+        )
 
     if not warnings:
         verdict = (
@@ -1193,4 +1242,9 @@ def verify_orderbook(
         ),
         verdict=verdict,
         warnings=warnings,
+        vanished_10bp_usd=vanished_10bp_usd,
+        traded_10bp_usd=traded_10bp_usd,
+        cancelled_10bp_usd=cancelled_10bp_usd,
+        cancel_share_pct=cancel_share_pct,
+        cancel_to_fill_ratio=cancel_to_fill_ratio,
     )

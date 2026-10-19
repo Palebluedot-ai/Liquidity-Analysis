@@ -283,6 +283,11 @@ class VerificationReport:
 
     verdict: str
     warnings: List[str] = field(default_factory=list)
+    vanished_10bp_usd: float = 0.0
+    traded_10bp_usd: float = 0.0
+    cancelled_10bp_usd: float = 0.0
+    cancel_share_pct: float = 0.0
+    cancel_to_fill_ratio: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

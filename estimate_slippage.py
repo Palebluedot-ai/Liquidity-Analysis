@@ -23,6 +23,7 @@ from liquidity_analysis.exchanges import (
     SUPPORTED_EXCHANGES,
 )
 from liquidity_analysis.historical_tracker import (
+    incremental_rolling_sync,
     load_historical_dataset,
     refresh_historical_dataset,
 )
@@ -290,13 +291,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="通过五大交易所公开 API 重新分页拉取过去 365 天历史 K 线与逐笔成交并更新本地 1 年期基准库",
     )
+    ap.add_argument(
+        "--rolling-sync",
+        action="store_true",
+        help="执行滚动增量同步 (Rolling Incremental Sync): 仅拉取最新增量 K 线并合并沉淀至本地滚动压缩库 (保留最长 730 天)",
+    )
 
     args = ap.parse_args(argv)
 
-    if args.refresh_1y or args.backtest_1y:
-        ds = refresh_historical_dataset(365) if args.refresh_1y else load_historical_dataset()
-        if not ds:
+    if args.rolling_sync or args.refresh_1y or args.backtest_1y:
+        if args.refresh_1y:
             ds = refresh_historical_dataset(365)
+        elif args.rolling_sync:
+            ds = incremental_rolling_sync()
+        else:
+            ds = load_historical_dataset() or incremental_rolling_sync()
         if args.json:
             print(json.dumps(ds, indent=2, ensure_ascii=False))
             return 0

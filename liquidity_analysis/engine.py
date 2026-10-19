@@ -18,7 +18,10 @@ from .exchanges import (
     fetch_recent_trades,
 )
 from .fx import convert_notional_to_quote, get_usd_hkd_rate, quote_to_usd_and_hkd
-from .historical_tracker import evaluate_order_across_4_scenarios
+from .historical_tracker import (
+    evaluate_order_across_4_scenarios,
+    record_live_telemetry,
+)
 from .models import (
     DepthBand,
     FadeScenario,
@@ -455,6 +458,25 @@ def compute_real_execution_breakdown(
         data_source_note=data_source_note,
         historical_matrix=hist_matrix,
     )
+    if kline_stats is not None:
+        record_live_telemetry(
+            "live_execution_breakdown",
+            {
+                "exchange": exchange,
+                "symbol": symbol,
+                "side": side_norm,
+                "order_usd": round(order_usd, 2),
+                "static_slip_bp": round(static_slip_bp, 2),
+                "mm_retreat_bp": round(mm_retreat_bp, 2),
+                "hft_frontrun_bp": round(hft_frontrun_bp, 2),
+                "total_ob_bp": round(total_ob_bp, 2),
+                "avg_1m_vol_usd": round(avg_1m_vol_usd, 0),
+                "avg_1m_ofi_usd": round(avg_1m_ofi_usd, 0),
+                "sigma_1m_bp": round(sigma_1m_bp, 2),
+                "empirical_y": round(emp_y, 2),
+                "perm_ratio": round(perm_ratio, 2),
+            },
+        )
     return breakdown, mm_retreat_bp, (mm_retreat_bp + hft_frontrun_bp)
 
 
@@ -1251,6 +1273,21 @@ def verify_orderbook(
         )
     else:
         verdict = f"WARN — 发现 {len(warnings)} 项需要注意的盘口特征"
+
+    record_live_telemetry(
+        "live_cfr_verification",
+        {
+            "exchange": first.exchange,
+            "symbol": first.symbol,
+            "samples": samples,
+            "vanished_10bp_usd": round(vanished_10bp_usd, 0),
+            "traded_10bp_usd": round(traded_10bp_usd, 0),
+            "cancelled_10bp_usd": round(cancelled_10bp_usd, 0),
+            "cancel_share_pct": round(cancel_share_pct, 2),
+            "cancel_to_fill_ratio": round(cancel_to_fill_ratio, 2),
+            "level_retention_ratio": round(retention_ratio, 3),
+        },
+    )
 
     return VerificationReport(
         exchange=first.exchange,

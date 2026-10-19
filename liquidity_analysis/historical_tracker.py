@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Long-Horizon (365-Day / Multi-Year) Historical Large-Order Event Study & 4-Scenario Tracker.
+Long-Horizon (365-Day / Multi-Year) Historical Large-Order Event Study, 4-Scenario Tracker,
+and Rolling Incremental Persistence Engine (滚动增量数据仓库).
 
 Architectural Design (High Cohesion, Low Coupling / 高内聚、低耦合):
-  1. Layer 1 — Exchange Historical API Adapters (`ExchangeHistoricalAdapters`):
-     Encapsulates each exchange's specific pagination protocol (`startTime`/`endTime`/`after`/`since`)
-     and Two-Stage Hierarchical Funnel (Stage 1 Macro/Regime Scan -> Stage 2 High-Frequency 5m/15m
-     & Tick-by-Tick Trade Drill-Down). Outputs a unified bar dictionary schema.
+  1. Layer 1 — Exchange Historical & Incremental API Adapters (`ExchangeHistoricalAdapters`):
+     Encapsulates each exchange's specific pagination protocol (`startTime`/`endTime`/`after`/`since`),
+     Two-Stage Hierarchical Funnel (Stage 1 Macro/Regime Scan -> Stage 2 High-Frequency 5m/15m
+     & Tick-by-Tick Trade Drill-Down), AND lightweight incremental delta fetchers (`since_ms -> now_ms`).
        - Binance  : `GET /api/v3/klines` (`startTime` pagination, 2017~present) + `GET /api/v3/aggTrades`
-       - OKX      : `GET /api/v5/market/history-candles` (`after` backward pagination, multi-year)
+       - OKX      : `GET /api/v5/market/history-candles` (`after`/`before` pagination, multi-year)
        - Coinbase : `GET /products/{id}/candles` (`start`/`end` ISO pagination, 2015~present)
        - Kraken   : `GET /0/public/OHLC` (`1d`/`4h`/`1h`/`15m`) + `GET /0/public/Trades?since=<ns>` (2013~present)
-       - HashKey  : `GET /quote/v1/klines` (`endTime` backward pagination, 365d)
+       - HashKey  : `GET /quote/v1/klines` (`endTime`/`startTime` pagination, 365d)
 
   2. Layer 2 — 4-Scenario Regime Classifier & Impact Scaling Engine (`ScenarioEventAnalyzer`):
      Stateless quantitative domain logic completely decoupled from network I/O.
@@ -21,18 +22,26 @@ Architectural Design (High Cohesion, Low Coupling / 高内聚、低耦合):
        - `extreme_stampede` : ③ 极端踩踏 / 恐慌清算真空期 (高波动或连环清算触发 MM 熔断撤单，订单簿流动性真空)
        - `contrarian_dip`   : ④ 逆势抄底 / 逢高派发期 (逆着前序趋势反向大额吃单，触发高频毒性防卫)
 
-  3. Layer 3 — Dataset Repository & Formatter (`HistoricalScenarioRepository`):
-     Manages reading/writing the local 365-day benchmark store (`data/historical_scenarios_1y.json`)
-     with an in-memory cache so normal CLI/Lark evaluations incur zero HTTP latency, while supporting
-     on-demand live API refresh (`refresh_historical_dataset`).
+  3. Layer 3 — 3-Tier Rolling Incremental Persistence Repository (`RollingHistoricalRepository`):
+     Ensures all fetched numbers, bars, real cases, and live telemetry accumulate continuously:
+       - Tier A (`data/rolling_hf_bars.json.gz`): Compressed deduplicated rolling time-series store
+         (`ts -> bar`) across all 5 exchanges (retains up to 730 days = 2 years of rolling bars).
+       - Tier B (`data/rolling_large_order_cases.jsonl`): Append-only deduplicated ledger of all
+         notable historical large-order impact cases across all 4 market scenarios.
+       - Tier C (`data/rolling_live_telemetry.jsonl`): Rolling append log of live L2/K-line/CFR
+         observations captured during real-time CLI / Lark Bot queries.
+       - Summary Index (`data/historical_scenarios_1y.json`): Pre-computed 4-Scenario quantile
+         benchmarks loaded in `< 0.1ms` during user queries.
 """
 
 from __future__ import annotations
 
+import gzip
 import json
 import math
 import os
 import statistics
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -55,13 +64,22 @@ SCENARIO_DEFINITIONS: List[Tuple[str, str]] = [
     ("contrarian_dip", "④ 逆势抄底/逢高派发期 (Contrarian)"),
 ]
 
-DEFAULT_DATASET_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "data",
-    "historical_scenarios_1y.json",
-)
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+DEFAULT_DATASET_PATH = os.path.join(DATA_DIR, "historical_scenarios_1y.json")
+ROLLING_BARS_GZ_PATH = os.path.join(DATA_DIR, "rolling_hf_bars.json.gz")
+ROLLING_CASES_JSONL_PATH = os.path.join(DATA_DIR, "rolling_large_order_cases.jsonl")
+ROLLING_LIVE_TELEMETRY_PATH = os.path.join(DATA_DIR, "rolling_live_telemetry.jsonl")
+
+EXCHANGE_STUDY_CONFIGS: List[Tuple[str, str, float, str, str]] = [
+    ("binance", "Binance (BTCUSDT)", 2_000_000.0, "5m", "REST /api/v3/klines (startTime..endTime, 365d+ rolling)"),
+    ("okx", "OKX (BTC-USDT)", 1_500_000.0, "15m", "REST /api/v5/market/history-candles (after pagination, 365d+ rolling)"),
+    ("coinbase", "Coinbase (BTC-USD)", 1_500_000.0, "15m", "REST /products/BTC-USD/candles (start..end ISO, 365d+ rolling)"),
+    ("kraken", "Kraken (XBTUSD)", 1_000_000.0, "15m + Tick", "REST /0/public/OHLC + /0/public/Trades?since=<ns> (365d+ rolling)"),
+    ("hashkey_global", "HashKey (BTCUSD)", 200_000.0, "15m", "REST /quote/v1/klines (endTime pagination, 365d+ rolling)"),
+]
 
 _MEMORY_DATASET_CACHE: Optional[Dict[str, Any]] = None
+_FILE_LOCK = threading.Lock()
 
 
 def _ts_str(ms: int) -> str:
@@ -77,7 +95,7 @@ def _pct(vals: Sequence[float], q: float) -> float:
 
 
 # ============================================================================
-# LAYER 1: Exchange Long-Horizon Historical API Adapters (Low Coupling)
+# LAYER 1: Exchange Long-Horizon & Incremental API Adapters (Low Coupling)
 # ============================================================================
 
 def fetch_binance_agg_trades(
@@ -162,6 +180,60 @@ def fetch_kraken_tick_trades_since(
     return parsed, next_cursor
 
 
+def _parse_binance_raw_kline(b: list) -> Optional[Dict[str, Any]]:
+    ts = int(b[0])
+    o, h, l, c = float(b[1]), float(b[2]), float(b[3]), float(b[4])
+    if o <= 0:
+        return None
+    quote_vol = float(b[7])
+    trades = int(b[8])
+    taker_buy = float(b[10])
+    taker_sell = max(0.0, quote_vol - taker_buy)
+    net_flow = taker_buy - taker_sell
+    abs_net = abs(net_flow)
+    is_buy = net_flow >= 0
+    return {
+        "ts": ts,
+        "dt": _ts_str(ts),
+        "open": o, "high": h, "low": l, "close": c,
+        "quote_vol": quote_vol,
+        "abs_net": abs_net,
+        "net_flow": net_flow,
+        "dir": "BUY" if is_buy else "SELL",
+        "trades": trades,
+        "peak_bp": ((h - o) if is_buy else (o - l)) / o * 10000.0,
+        "perm_bp": ((c - o) if is_buy else (o - c)) / o * 10000.0,
+        "range_bp": (h - l) / o * 10000.0,
+        "ret_bp": (c - o) / o * 10000.0,
+    }
+
+
+def _parse_clv_kline(
+    ts: int, o: float, h: float, l: float, c: float, quote_vol: float, trades: int = 0
+) -> Optional[Dict[str, Any]]:
+    if o <= 0 or (h - l) <= 0 or quote_vol <= 0:
+        return None
+    clv = abs(c - o) / (h - l)
+    est_imb = max(0.18, min(0.85, 0.20 + 0.65 * clv))
+    abs_net = quote_vol * est_imb
+    is_buy = c >= o
+    net_flow = abs_net if is_buy else -abs_net
+    return {
+        "ts": ts,
+        "dt": _ts_str(ts),
+        "open": o, "high": h, "low": l, "close": c,
+        "quote_vol": quote_vol,
+        "abs_net": abs_net,
+        "net_flow": net_flow,
+        "dir": "BUY" if is_buy else "SELL",
+        "trades": trades,
+        "peak_bp": ((h - o) if is_buy else (o - l)) / o * 10000.0,
+        "perm_bp": ((c - o) if is_buy else (o - c)) / o * 10000.0,
+        "range_bp": (h - l) / o * 10000.0,
+        "ret_bp": (c - o) / o * 10000.0,
+    }
+
+
 def fetch_binance_historical_bars(
     symbol: str = "BTCUSDT",
     horizon_days: int = 365,
@@ -196,6 +268,7 @@ def fetch_binance_historical_bars(
     step_days = max(7, horizon_days // 24)
     for d in range(0, horizon_days, step_days):
         target_starts.add(start_horizon_ms + d * DAY_MS)
+    target_starts.add(max(start_horizon_ms, now_ms - 3 * DAY_MS))
 
     scored_1h = []
     for b in bars_1h:
@@ -209,7 +282,7 @@ def fetch_binance_historical_bars(
         win_start = ts - 12 * 3600_000
         if all(abs(win_start - existing) > 2 * DAY_MS for existing in target_starts):
             target_starts.add(win_start)
-        if len(target_starts) >= 36:
+        if len(target_starts) >= 37:
             break
 
     bars_hf_map: Dict[int, list] = {}
@@ -230,34 +303,11 @@ def fetch_binance_historical_bars(
             for b in chunk:
                 bars_hf_map[int(b[0])] = b
 
-    raw_hf = [bars_hf_map[k] for k in sorted(bars_hf_map.keys())]
     parsed = []
-    for b in raw_hf:
-        ts = int(b[0])
-        o, h, l, c = float(b[1]), float(b[2]), float(b[3]), float(b[4])
-        quote_vol = float(b[7])
-        trades = int(b[8])
-        taker_buy = float(b[10])
-        taker_sell = max(0.0, quote_vol - taker_buy)
-        net_flow = taker_buy - taker_sell
-        abs_net = abs(net_flow)
-        if o <= 0:
-            continue
-        is_buy = net_flow >= 0
-        parsed.append({
-            "ts": ts,
-            "dt": _ts_str(ts),
-            "open": o, "high": h, "low": l, "close": c,
-            "quote_vol": quote_vol,
-            "abs_net": abs_net,
-            "net_flow": net_flow,
-            "dir": "BUY" if is_buy else "SELL",
-            "trades": trades,
-            "peak_bp": ((h - o) if is_buy else (o - l)) / o * 10000.0,
-            "perm_bp": ((c - o) if is_buy else (o - c)) / o * 10000.0,
-            "range_bp": (h - l) / o * 10000.0,
-            "ret_bp": (c - o) / o * 10000.0,
-        })
+    for k in sorted(bars_hf_map.keys()):
+        item = _parse_binance_raw_kline(bars_hf_map[k])
+        if item:
+            parsed.append(item)
     return parsed, len(bars_1h)
 
 
@@ -342,33 +392,15 @@ def fetch_okx_historical_bars(
             for b in chunk:
                 bars_hf_map[int(b[0])] = b
 
-    raw_hf = [bars_hf_map[k] for k in sorted(bars_hf_map.keys())]
     parsed = []
-    for b in raw_hf:
+    for k in sorted(bars_hf_map.keys()):
+        b = bars_hf_map[k]
         ts = int(b[0])
         o, h, l, c = float(b[1]), float(b[2]), float(b[3]), float(b[4])
         quote_vol = float(b[7]) if len(b) > 7 else float(b[6])
-        if o <= 0 or (h - l) <= 0:
-            continue
-        clv = abs(c - o) / (h - l)
-        est_imb = max(0.18, min(0.85, 0.20 + 0.65 * clv))
-        abs_net = quote_vol * est_imb
-        is_buy = c >= o
-        net_flow = abs_net if is_buy else -abs_net
-        parsed.append({
-            "ts": ts,
-            "dt": _ts_str(ts),
-            "open": o, "high": h, "low": l, "close": c,
-            "quote_vol": quote_vol,
-            "abs_net": abs_net,
-            "net_flow": net_flow,
-            "dir": "BUY" if is_buy else "SELL",
-            "trades": 0,
-            "peak_bp": ((h - o) if is_buy else (o - l)) / o * 10000.0,
-            "perm_bp": ((c - o) if is_buy else (o - c)) / o * 10000.0,
-            "range_bp": (h - l) / o * 10000.0,
-            "ret_bp": (c - o) / o * 10000.0,
-        })
+        item = _parse_clv_kline(ts, o, h, l, c, quote_vol)
+        if item:
+            parsed.append(item)
     return parsed, len(bars_4h)
 
 
@@ -408,6 +440,7 @@ def fetch_coinbase_historical_bars(
     step_days = max(7, horizon_days // 24)
     for d in range(0, horizon_days, step_days):
         target_starts.add(start_horizon_ms + d * DAY_MS)
+    target_starts.add(max(start_horizon_ms, now_ms - 3 * DAY_MS))
 
     scored_6h = []
     for b in bars_6h:
@@ -420,7 +453,7 @@ def fetch_coinbase_historical_bars(
     for _, ts in scored_6h[:30]:
         if all(abs(ts - ex_ts) > 2 * DAY_MS for ex_ts in target_starts):
             target_starts.add(max(start_horizon_ms, ts))
-        if len(target_starts) >= 38:
+        if len(target_starts) >= 39:
             break
 
     bars_hf_map: Dict[int, list] = {}
@@ -444,33 +477,15 @@ def fetch_coinbase_historical_bars(
             for b in chunk:
                 bars_hf_map[int(b[0])] = b
 
-    raw_hf = [bars_hf_map[k] for k in sorted(bars_hf_map.keys())]
     parsed = []
-    for b in raw_hf:
+    for k in sorted(bars_hf_map.keys()):
+        b = bars_hf_map[k]
         ts = int(b[0]) * 1000
         l, h, o, c, vol = float(b[1]), float(b[2]), float(b[3]), float(b[4]), float(b[5])
-        if o <= 0 or (h - l) <= 0:
-            continue
         quote_vol = vol * ((o + c) / 2.0)
-        clv = abs(c - o) / (h - l)
-        est_imb = max(0.18, min(0.85, 0.20 + 0.65 * clv))
-        abs_net = quote_vol * est_imb
-        is_buy = c >= o
-        net_flow = abs_net if is_buy else -abs_net
-        parsed.append({
-            "ts": ts,
-            "dt": _ts_str(ts),
-            "open": o, "high": h, "low": l, "close": c,
-            "quote_vol": quote_vol,
-            "abs_net": abs_net,
-            "net_flow": net_flow,
-            "dir": "BUY" if is_buy else "SELL",
-            "trades": 0,
-            "peak_bp": ((h - o) if is_buy else (o - l)) / o * 10000.0,
-            "perm_bp": ((c - o) if is_buy else (o - c)) / o * 10000.0,
-            "range_bp": (h - l) / o * 10000.0,
-            "ret_bp": (c - o) / o * 10000.0,
-        })
+        item = _parse_clv_kline(ts, o, h, l, c, quote_vol)
+        if item:
+            parsed.append(item)
     return parsed, len(bars_6h)
 
 
@@ -561,24 +576,10 @@ def fetch_kraken_historical_bars_and_ticks(
         o, h, l, c = float(b[1]), float(b[2]), float(b[3]), float(b[4])
         vol = float(b[6])
         trades = int(b[7])
-        if o <= 0 or (h - l) <= 0:
-            continue
         quote_vol = vol * ((o + c) / 2.0)
-        clv = abs(c - o) / (h - l)
-        est_imb = max(0.18, min(0.85, 0.20 + 0.65 * clv))
-        abs_net = quote_vol * est_imb
-        is_buy = c >= o
-        net_flow = abs_net if is_buy else -abs_net
-        parsed_map[ts] = {
-            "ts": ts, "dt": _ts_str(ts),
-            "open": o, "high": h, "low": l, "close": c,
-            "quote_vol": quote_vol, "abs_net": abs_net, "net_flow": net_flow,
-            "dir": "BUY" if is_buy else "SELL", "trades": trades,
-            "peak_bp": ((h - o) if is_buy else (o - l)) / o * 10000.0,
-            "perm_bp": ((c - o) if is_buy else (o - c)) / o * 10000.0,
-            "range_bp": (h - l) / o * 10000.0,
-            "ret_bp": (c - o) / o * 10000.0,
-        }
+        item = _parse_clv_kline(ts, o, h, l, c, quote_vol, trades=trades)
+        if item:
+            parsed_map[ts] = item
 
     for bk in tick_reconstructed_15m:
         ts = bk["ts"]
@@ -656,31 +657,141 @@ def fetch_hashkey_historical_bars(
             for b in chunk:
                 bars_hf_map[int(b[0])] = b
 
-    raw_hf = [bars_hf_map[k] for k in sorted(bars_hf_map.keys())]
     parsed = []
-    for b in raw_hf:
+    for k in sorted(bars_hf_map.keys()):
+        b = bars_hf_map[k]
         ts = int(b[0])
         o, h, l, c = float(b[1]), float(b[2]), float(b[3]), float(b[4])
         vol = float(b[5])
         quote_vol = float(b[7]) if len(b) > 7 and float(b[7]) > 0 else vol * ((o + c) / 2.0)
-        if o <= 0 or (h - l) <= 0 or quote_vol <= 0:
-            continue
-        clv = abs(c - o) / (h - l)
-        est_imb = max(0.20, min(0.85, 0.22 + 0.63 * clv))
-        abs_net = quote_vol * est_imb
-        is_buy = c >= o
-        net_flow = abs_net if is_buy else -abs_net
-        parsed.append({
-            "ts": ts, "dt": _ts_str(ts),
-            "open": o, "high": h, "low": l, "close": c,
-            "quote_vol": quote_vol, "abs_net": abs_net, "net_flow": net_flow,
-            "dir": "BUY" if is_buy else "SELL", "trades": int(b[8]) if len(b) > 8 else 0,
-            "peak_bp": ((h - o) if is_buy else (o - l)) / o * 10000.0,
-            "perm_bp": ((c - o) if is_buy else (o - c)) / o * 10000.0,
-            "range_bp": (h - l) / o * 10000.0,
-            "ret_bp": (c - o) / o * 10000.0,
-        })
+        trades = int(b[8]) if len(b) > 8 else 0
+        item = _parse_clv_kline(ts, o, h, l, c, quote_vol, trades=trades)
+        if item:
+            parsed.append(item)
     return parsed, len(bars_1h_map)
+
+
+def fetch_incremental_bars_since(
+    exchange: str,
+    since_ms: int,
+    session: Optional[requests.Session] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Lightweight Incremental Delta Adapter:
+    Fetches ONLY the newly closed high-frequency bars since `since_ms` for the given exchange.
+    Used by `incremental_rolling_sync()` so new data is continuously accumulated in ~1 second.
+    """
+    sess = session or requests.Session()
+    now_ms = int(time.time() * 1000)
+    ex = exchange.lower().strip()
+    out: List[Dict[str, Any]] = []
+
+    try:
+        if ex == "binance":
+            cur = max(since_ms, now_ms - 10 * DAY_MS)
+            while cur < now_ms:
+                r = sess.get(
+                    "https://data-api.binance.vision/api/v3/klines",
+                    params={"symbol": "BTCUSDT", "interval": "5m", "startTime": cur, "limit": 1000},
+                    timeout=8,
+                ).json()
+                if not isinstance(r, list) or not r:
+                    break
+                for b in r:
+                    item = _parse_binance_raw_kline(b)
+                    if item:
+                        out.append(item)
+                if len(r) < 1000:
+                    break
+                cur = int(r[-1][0]) + 300_000
+
+        elif ex == "okx":
+            after_cur = now_ms
+            for _ in range(5):
+                r = sess.get(
+                    "https://www.okx.com/api/v5/market/history-candles",
+                    params={"instId": "BTC-USDT", "bar": "15m", "after": str(after_cur), "limit": "100"},
+                    timeout=8,
+                ).json()
+                data = r.get("data", [])
+                if not data:
+                    break
+                for b in data:
+                    ts = int(b[0])
+                    o, h, l, c = float(b[1]), float(b[2]), float(b[3]), float(b[4])
+                    q_vol = float(b[7]) if len(b) > 7 else float(b[6])
+                    item = _parse_clv_kline(ts, o, h, l, c, q_vol)
+                    if item:
+                        out.append(item)
+                oldest_in_batch = int(data[-1][0])
+                if oldest_in_batch <= since_ms:
+                    break
+                after_cur = oldest_in_batch
+                time.sleep(0.08)
+
+        elif ex == "coinbase":
+            cur = max(since_ms, now_ms - 12 * DAY_MS)
+            step_ms = 300 * 900 * 1000
+            while cur < now_ms:
+                en_ms = min(now_ms, cur + step_ms)
+                st_iso = datetime.fromtimestamp(cur / 1000.0, tz=timezone.utc).isoformat()
+                en_iso = datetime.fromtimestamp(en_ms / 1000.0, tz=timezone.utc).isoformat()
+                r = sess.get(
+                    "https://api.exchange.coinbase.com/products/BTC-USD/candles",
+                    params={"granularity": 900, "start": st_iso, "end": en_iso},
+                    timeout=8,
+                ).json()
+                if isinstance(r, list):
+                    for b in r:
+                        ts = int(b[0]) * 1000
+                        l, h, o, c, vol = float(b[1]), float(b[2]), float(b[3]), float(b[4]), float(b[5])
+                        item = _parse_clv_kline(ts, o, h, l, c, vol * ((o + c) / 2.0))
+                        if item:
+                            out.append(item)
+                cur = en_ms
+
+        elif ex == "kraken":
+            # Pull latest 720 x 15m OHLC bars (7.5 days) so Kraken never loses 15m history as time rolls forward!
+            r = sess.get(
+                "https://api.kraken.com/0/public/OHLC",
+                params={"pair": "XBTUSD", "interval": 15},
+                timeout=8,
+            ).json()
+            res = r.get("result", {})
+            k_list = [k for k in res.keys() if k != "last"]
+            if k_list:
+                for b in res[k_list[0]]:
+                    ts = int(b[0]) * 1000
+                    if ts >= since_ms - DAY_MS:
+                        o, h, l, c = float(b[1]), float(b[2]), float(b[3]), float(b[4])
+                        vol = float(b[6])
+                        trades = int(b[7])
+                        item = _parse_clv_kline(ts, o, h, l, c, vol * ((o + c) / 2.0), trades=trades)
+                        if item:
+                            out.append(item)
+
+        elif ex in ("hashkey_global", "hashkey", "hashkey_hk"):
+            r = sess.get(
+                "https://api-pro.hashkey.com/quote/v1/klines",
+                params={"symbol": "BTCUSD", "interval": "15m", "limit": 1000},
+                timeout=8,
+            ).json()
+            if isinstance(r, list):
+                for b in r:
+                    ts = int(b[0])
+                    if ts >= since_ms - DAY_MS:
+                        o, h, l, c = float(b[1]), float(b[2]), float(b[3]), float(b[4])
+                        vol = float(b[5])
+                        q_vol = float(b[7]) if len(b) > 7 and float(b[7]) > 0 else vol * ((o + c) / 2.0)
+                        trades = int(b[8]) if len(b) > 8 else 0
+                        item = _parse_clv_kline(ts, o, h, l, c, q_vol, trades=trades)
+                        if item:
+                            out.append(item)
+    except Exception:
+        pass
+
+    out.sort(key=lambda x: x["ts"])
+    return out
 
 
 # ============================================================================
@@ -755,7 +866,6 @@ def classify_bars_into_scenarios(
         top_cases: List[Dict[str, Any]] = []
         used_days = set()
 
-        # Pass 1: Include top BUY cases (e.g. 上涨追高抢筹 / 恐慌轧空 / 正常大买单)
         for e in sorted_evs:
             day_str = e["dt"][:10]
             if e["dir"] == "BUY" and day_str not in used_days and e["peak_bp"] >= med_peak:
@@ -776,7 +886,6 @@ def classify_bars_into_scenarios(
             if len(top_cases) >= 3:
                 break
 
-        # Pass 2: Include top SELL cases (e.g. 顺势杀跌 / 连环清算砸盘 / 正常大卖单)
         for e in sorted_evs:
             day_str = e["dt"][:10]
             if e["dir"] == "SELL" and day_str not in used_days and e["peak_bp"] >= med_peak:
@@ -812,11 +921,97 @@ def classify_bars_into_scenarios(
 
 
 # ============================================================================
-# LAYER 3: Dataset Repository & Order Scenario Evaluator
+# LAYER 3: 3-Tier Rolling Incremental Persistence Repository
 # ============================================================================
 
+def _load_rolling_bars_store(store_path: str = ROLLING_BARS_GZ_PATH) -> Dict[str, Any]:
+    """Load the compressed rolling high-frequency bar store (`rolling_hf_bars.json.gz`)."""
+    if not os.path.exists(store_path):
+        return {"updated_at_utc": "", "exchanges": {}}
+    try:
+        with gzip.open(store_path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"updated_at_utc": "", "exchanges": {}}
+
+
+def _save_rolling_bars_store(store: Dict[str, Any], store_path: str = ROLLING_BARS_GZ_PATH) -> None:
+    """Persist the compressed rolling high-frequency bar store (`rolling_hf_bars.json.gz`)."""
+    os.makedirs(os.path.dirname(os.path.abspath(store_path)), exist_ok=True)
+    with _FILE_LOCK:
+        with gzip.open(store_path, "wt", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False)
+
+
+def _append_rolling_cases_ledger(
+    exchange_key: str,
+    scenarios_summary: Dict[str, Dict[str, Any]],
+    ledger_path: str = ROLLING_CASES_JSONL_PATH,
+) -> int:
+    """
+    Append newly discovered large-order cases into `rolling_large_order_cases.jsonl`
+    with automatic deduplication by `(exchange, dt, dir)`.
+    Returns the number of newly appended cases.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(ledger_path)), exist_ok=True)
+    existing_keys = set()
+    if os.path.exists(ledger_path):
+        try:
+            with open(ledger_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    existing_keys.add(f"{obj.get('exchange')}:{obj.get('dt')}:{obj.get('dir')}")
+        except Exception:
+            pass
+
+    appended = 0
+    with _FILE_LOCK:
+        with open(ledger_path, "a", encoding="utf-8") as f:
+            for s_key, s_obj in scenarios_summary.items():
+                for c in s_obj.get("top_cases", []):
+                    uniq_k = f"{exchange_key}:{c['dt']}:{c['dir']}"
+                    if uniq_k not in existing_keys:
+                        existing_keys.add(uniq_k)
+                        rec = {
+                            "exchange": exchange_key,
+                            "scenario": s_key,
+                            **c,
+                            "recorded_at_utc": _ts_str(int(time.time() * 1000)),
+                        }
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        appended += 1
+    return appended
+
+
+def record_live_telemetry(
+    record_type: str,
+    payload: Dict[str, Any],
+    telemetry_path: str = ROLLING_LIVE_TELEMETRY_PATH,
+) -> None:
+    """
+    Tier C Rolling Store: Non-blockingly append live L2/K-line/CFR observations captured
+    during real-time queries into `rolling_live_telemetry.jsonl` so every live measurement
+    accumulates over time.
+    """
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(telemetry_path)), exist_ok=True)
+        entry = {
+            "ts_utc": _ts_str(int(time.time() * 1000)),
+            "record_type": record_type,
+            **payload,
+        }
+        with _FILE_LOCK:
+            with open(telemetry_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def load_historical_dataset(dataset_path: str = DEFAULT_DATASET_PATH) -> Optional[Dict[str, Any]]:
-    """Load the 365-day multi-exchange scenario dataset with in-memory caching."""
+    """Load the 365-day+ multi-exchange scenario dataset with in-memory caching."""
     global _MEMORY_DATASET_CACHE
     if _MEMORY_DATASET_CACHE is not None and dataset_path == DEFAULT_DATASET_PATH:
         return _MEMORY_DATASET_CACHE
@@ -835,16 +1030,22 @@ def load_historical_dataset(dataset_path: str = DEFAULT_DATASET_PATH) -> Optiona
 def refresh_historical_dataset(
     horizon_days: int = 365,
     output_path: str = DEFAULT_DATASET_PATH,
+    bars_store_path: str = ROLLING_BARS_GZ_PATH,
+    cases_ledger_path: str = ROLLING_CASES_JSONL_PATH,
+    max_retention_days: int = 730,
 ) -> Dict[str, Any]:
     """
-    Re-fetch `horizon_days` (default 365 days = 1 full year) of historical bars & ticks
-    across Binance, OKX, Coinbase, Kraken, and HashKey via public APIs and persist to JSON.
+    Full 365-Day Bootstrap + Rolling Merge:
+    Fetches `horizon_days` across Binance, OKX, Coinbase, Kraken, and HashKey,
+    merges them with any previously stored bars in `rolling_hf_bars.json.gz` (never losing
+    previously accumulated bars up to `max_retention_days = 730` days), appends new cases
+    to `rolling_large_order_cases.jsonl`, and writes `historical_scenarios_1y.json`.
     """
     global _MEMORY_DATASET_CACHE
     session = requests.Session()
     session.headers.update({"User-Agent": "LiquidityAnalysis-HistoricalTracker/1.0"})
     now_ms = int(time.time() * 1000)
-    start_ms = now_ms - horizon_days * DAY_MS
+    cutoff_ms = now_ms - max_retention_days * DAY_MS
 
     bn_bars, bn_s1 = fetch_binance_historical_bars(horizon_days=horizon_days, session=session)
     okx_bars, okx_s1 = fetch_okx_historical_bars(horizon_days=horizon_days, session=session)
@@ -852,42 +1053,203 @@ def refresh_historical_dataset(
     kr_bars, kr_s1 = fetch_kraken_historical_bars_and_ticks(horizon_days=horizon_days, session=session)
     hk_bars, hk_s1 = fetch_hashkey_historical_bars(horizon_days=horizon_days, session=session)
 
+    rolling_store = _load_rolling_bars_store(bars_store_path)
+    ex_store_map = rolling_store.setdefault("exchanges", {})
+
+    fetched_by_ex = {
+        "binance": (bn_bars, bn_s1),
+        "okx": (okx_bars, okx_s1),
+        "coinbase": (cb_bars, cb_s1),
+        "kraken": (kr_bars, kr_s1),
+        "hashkey_global": (hk_bars, hk_s1),
+    }
+
     dataset: Dict[str, Any] = {
         "generated_at_utc": _ts_str(now_ms),
         "horizon_days": horizon_days,
-        "window_start_utc": _ts_str(start_ms),
+        "window_start_utc": _ts_str(now_ms - horizon_days * DAY_MS),
         "window_end_utc": _ts_str(now_ms),
+        "rolling_store_enabled": True,
         "exchanges": {},
     }
 
-    configs = [
-        ("binance", "Binance (BTCUSDT)", bn_bars, bn_s1, 2_000_000, "5m", "REST /api/v3/klines (startTime..endTime, 365d)"),
-        ("okx", "OKX (BTC-USDT)", okx_bars, okx_s1, 1_500_000, "15m", "REST /api/v5/market/history-candles (after pagination, 365d)"),
-        ("coinbase", "Coinbase (BTC-USD)", cb_bars, cb_s1, 1_500_000, "15m", "REST /products/BTC-USD/candles (start..end ISO, 365d)"),
-        ("kraken", "Kraken (XBTUSD)", kr_bars, kr_s1, 1_000_000, "15m + Tick", "REST /0/public/OHLC + /0/public/Trades?since=<ns> (365d)"),
-        ("hashkey_global", "HashKey (BTCUSD)", hk_bars, hk_s1, 200_000, "15m", "REST /quote/v1/klines (endTime pagination, 365d)"),
-    ]
+    for key, label, min_usd, bar_interval, api_method in EXCHANGE_STUDY_CONFIGS:
+        new_bars, s1_cnt = fetched_by_ex[key]
+        prev_entry = ex_store_map.get(key, {})
+        prev_bars_list = prev_entry.get("bars", [])
 
-    for key, label, bars, s1_cnt, min_usd, bar_interval, api_method in configs:
-        scen = classify_bars_into_scenarios(bars, min_net_usd=min_usd)
+        # Merge old rolling bars + newly fetched bars by `ts`
+        merged_map: Dict[int, Dict[str, Any]] = {}
+        for b in prev_bars_list:
+            ts_val = int(b["ts"])
+            if ts_val >= cutoff_ms:
+                merged_map[ts_val] = b
+        for b in new_bars:
+            ts_val = int(b["ts"])
+            if ts_val >= cutoff_ms:
+                merged_map[ts_val] = b
+
+        merged_bars = [merged_map[k] for k in sorted(merged_map.keys())]
+        ex_store_map[key] = {
+            "stage1_macro_bars": max(s1_cnt, int(prev_entry.get("stage1_macro_bars", 0))),
+            "last_synced_ts_ms": merged_bars[-1]["ts"] if merged_bars else now_ms,
+            "bars": merged_bars,
+        }
+
+        scen = classify_bars_into_scenarios(merged_bars, min_net_usd=min_usd)
+        new_cases_cnt = _append_rolling_cases_ledger(key, scen, ledger_path=cases_ledger_path)
+
         dataset["exchanges"][key] = {
             "label": label,
             "api_method": api_method,
-            "stage1_macro_bars": s1_cnt,
-            "stage2_high_freq_bars": len(bars),
+            "stage1_macro_bars": ex_store_map[key]["stage1_macro_bars"],
+            "stage2_high_freq_bars": len(merged_bars),
             "high_freq_interval": bar_interval,
             "min_large_order_net_usd": min_usd,
-            "span_start_utc": bars[0]["dt"] if bars else "",
-            "span_end_utc": bars[-1]["dt"] if bars else "",
+            "span_start_utc": merged_bars[0]["dt"] if merged_bars else "",
+            "span_end_utc": merged_bars[-1]["dt"] if merged_bars else "",
+            "last_synced_ts_ms": ex_store_map[key]["last_synced_ts_ms"],
+            "newly_appended_cases": new_cases_cnt,
             "scenarios": scen,
         }
+
+    rolling_store["updated_at_utc"] = _ts_str(now_ms)
+    _save_rolling_bars_store(rolling_store, bars_store_path)
 
     dataset["exchanges"]["hashkey_hk"] = dict(dataset["exchanges"]["hashkey_global"])
     dataset["exchanges"]["hashkey_hk"]["label"] = "HashKey HK (BTCUSD)"
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(dataset, f, ensure_ascii=False, indent=2)
+    with _FILE_LOCK:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(dataset, f, ensure_ascii=False, indent=2)
+
+    if output_path == DEFAULT_DATASET_PATH:
+        _MEMORY_DATASET_CACHE = dataset
+    return dataset
+
+
+def incremental_rolling_sync(
+    output_path: str = DEFAULT_DATASET_PATH,
+    bars_store_path: str = ROLLING_BARS_GZ_PATH,
+    cases_ledger_path: str = ROLLING_CASES_JSONL_PATH,
+    max_retention_days: int = 730,
+) -> Dict[str, Any]:
+    """
+    Fast Rolling Incremental Sync (`--rolling-sync`):
+    If `rolling_hf_bars.json.gz` does not exist yet, performs a full 365-day bootstrap.
+    Otherwise, queries ONLY the incremental delta bars since `last_synced_ts_ms` across all
+    5 exchanges in parallel (~1.5s), merges & deduplicates them into `rolling_hf_bars.json.gz`,
+    appends any new extreme cases to `rolling_large_order_cases.jsonl`, and updates
+    `historical_scenarios_1y.json`.
+    """
+    global _MEMORY_DATASET_CACHE
+    if not os.path.exists(bars_store_path):
+        return refresh_historical_dataset(
+            horizon_days=365,
+            output_path=output_path,
+            bars_store_path=bars_store_path,
+            cases_ledger_path=cases_ledger_path,
+            max_retention_days=max_retention_days,
+        )
+
+    rolling_store = _load_rolling_bars_store(bars_store_path)
+    ex_store_map = rolling_store.setdefault("exchanges", {})
+    if not ex_store_map:
+        return refresh_historical_dataset(
+            horizon_days=365,
+            output_path=output_path,
+            bars_store_path=bars_store_path,
+            cases_ledger_path=cases_ledger_path,
+            max_retention_days=max_retention_days,
+        )
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "LiquidityAnalysis-RollingSync/1.0"})
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - max_retention_days * DAY_MS
+
+    def _sync_one(cfg: Tuple[str, str, float, str, str]) -> Tuple[str, List[Dict[str, Any]]]:
+        key = cfg[0]
+        last_ts = int(ex_store_map.get(key, {}).get("last_synced_ts_ms", now_ms - 7 * DAY_MS))
+        # Overlap by 1 hour to ensure boundary bars are updated with final close values
+        delta_bars = fetch_incremental_bars_since(key, since_ms=last_ts - 3600_000, session=session)
+        return key, delta_bars
+
+    deltas_by_ex: Dict[str, List[Dict[str, Any]]] = {}
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for k, d_bars in pool.map(_sync_one, EXCHANGE_STUDY_CONFIGS):
+            deltas_by_ex[k] = d_bars
+
+    dataset: Dict[str, Any] = {
+        "generated_at_utc": _ts_str(now_ms),
+        "horizon_days": 365,
+        "window_start_utc": "",
+        "window_end_utc": _ts_str(now_ms),
+        "rolling_store_enabled": True,
+        "exchanges": {},
+    }
+
+    earliest_ms = now_ms
+    for key, label, min_usd, bar_interval, api_method in EXCHANGE_STUDY_CONFIGS:
+        prev_entry = ex_store_map.get(key, {})
+        prev_bars_list = prev_entry.get("bars", [])
+        delta_bars = deltas_by_ex.get(key, [])
+
+        merged_map: Dict[int, Dict[str, Any]] = {}
+        for b in prev_bars_list:
+            ts_val = int(b["ts"])
+            if ts_val >= cutoff_ms:
+                merged_map[ts_val] = b
+        before_cnt = len(merged_map)
+        for b in delta_bars:
+            ts_val = int(b["ts"])
+            if ts_val >= cutoff_ms:
+                merged_map[ts_val] = b
+        added_bars_cnt = max(0, len(merged_map) - before_cnt)
+
+        merged_bars = [merged_map[k] for k in sorted(merged_map.keys())]
+        if merged_bars:
+            earliest_ms = min(earliest_ms, merged_bars[0]["ts"])
+
+        ex_store_map[key] = {
+            "stage1_macro_bars": int(prev_entry.get("stage1_macro_bars", 0)),
+            "last_synced_ts_ms": merged_bars[-1]["ts"] if merged_bars else now_ms,
+            "bars": merged_bars,
+        }
+
+        scen = classify_bars_into_scenarios(merged_bars, min_net_usd=min_usd)
+        new_cases_cnt = _append_rolling_cases_ledger(key, scen, ledger_path=cases_ledger_path)
+
+        dataset["exchanges"][key] = {
+            "label": label,
+            "api_method": api_method,
+            "stage1_macro_bars": ex_store_map[key]["stage1_macro_bars"],
+            "stage2_high_freq_bars": len(merged_bars),
+            "high_freq_interval": bar_interval,
+            "min_large_order_net_usd": min_usd,
+            "span_start_utc": merged_bars[0]["dt"] if merged_bars else "",
+            "span_end_utc": merged_bars[-1]["dt"] if merged_bars else "",
+            "last_synced_ts_ms": ex_store_map[key]["last_synced_ts_ms"],
+            "newly_added_bars": added_bars_cnt,
+            "newly_appended_cases": new_cases_cnt,
+            "scenarios": scen,
+        }
+
+    span_days = max(365, int(round((now_ms - earliest_ms) / DAY_MS)))
+    dataset["horizon_days"] = span_days
+    dataset["window_start_utc"] = _ts_str(earliest_ms)
+
+    rolling_store["updated_at_utc"] = _ts_str(now_ms)
+    _save_rolling_bars_store(rolling_store, bars_store_path)
+
+    dataset["exchanges"]["hashkey_hk"] = dict(dataset["exchanges"]["hashkey_global"])
+    dataset["exchanges"]["hashkey_hk"]["label"] = "HashKey HK (BTCUSD)"
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with _FILE_LOCK:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(dataset, f, ensure_ascii=False, indent=2)
 
     if output_path == DEFAULT_DATASET_PATH:
         _MEMORY_DATASET_CACHE = dataset
@@ -904,12 +1266,10 @@ def evaluate_order_across_4_scenarios(
     dataset_path: str = DEFAULT_DATASET_PATH,
 ) -> Optional[HistoricalScenarioMatrix]:
     """
-    Given an exchange and target order size `order_usd`, maps the 365-day empirical
+    Given an exchange and target order size `order_usd`, maps the rolling 365-day+ empirical
     4-scenario benchmarks (`normal_calm`, `momentum_chase`, `extreme_stampede`, `contrarian_dip`)
-    to the user's specific order size using Square-Root Impact scaling:
-        Est_Impact(Q) = Hist_Peak_bp * (Q / Hist_Avg_Net_USD)^0.42
-    (where 0.42 is the empirical dampened square-root exponent across multi-minute bursts),
-    adds `taker_fee_bp + fiat_usdt_friction_bp`, and attaches real historical cases.
+    to the user's specific order size using Square-Root Impact scaling, adds
+    `taker_fee_bp + fiat_usdt_friction_bp`, and attaches real historical cases.
     """
     ds = load_historical_dataset(dataset_path)
     if not ds:
@@ -954,7 +1314,6 @@ def evaluate_order_across_4_scenarios(
         est_all_in_p90 = round(est_imp_p90 + fixed_friction_bp, 1)
 
         raw_cases = st.get("top_cases", [])
-        # Prioritize cases matching the user's trade direction (BUY vs SELL)
         matching_cases = [c for c in raw_cases if c.get("dir") == side_up]
         other_cases = [c for c in raw_cases if c.get("dir") != side_up]
         ordered_cases = (matching_cases + other_cases)[:3]

@@ -162,7 +162,7 @@ class TestLiquidityAnalysis(unittest.TestCase):
 
         ds = load_historical_dataset()
         self.assertIsNotNone(ds)
-        self.assertEqual(ds["horizon_days"], 365)
+        self.assertGreaterEqual(ds["horizon_days"], 365)
         for ex in ("binance", "okx", "coinbase", "kraken", "hashkey_global"):
             self.assertIn(ex, ds["exchanges"])
             mat = evaluate_order_across_4_scenarios(

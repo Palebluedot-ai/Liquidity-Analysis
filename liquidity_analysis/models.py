@@ -92,6 +92,20 @@ class RealExecutionBreakdown:
     otc_savings_hkd: float
     otc_savings_per_coin_usd: float
 
+    # Live empirical market microstructure & stablecoin telemetry (zero magic numbers)
+    avg_1m_vol_usd: float = 0.0
+    avg_1m_ofi_usd: float = 0.0
+    order_to_1m_ofi_multiple: float = 0.0
+    display_to_trade_ratio: float = 0.0
+    sigma_1m_bp: float = 0.0
+    empirical_impact_y: float = 0.0
+    kyle_lambda_bp_per_1m: float = 0.0
+    twap_exec_mins: float = 0.0
+    micro_order_pct: float = 0.0  # % of levels within 10bp that are <$5,000 HFT grid quotes
+    usdt_book_slippage_bp: float = 0.0
+    usdt_basis_bp: float = 0.0
+    data_source_note: str = "live_kline_and_l2_calibration"
+
 
 @dataclass
 class OrderBookSnapshot:

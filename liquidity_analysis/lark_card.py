@@ -299,9 +299,9 @@ def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
     lines: List[str] = [
         f"**标的**：`{first.base_asset}` ｜ **方向**：{side_cn}",
         f"**目标规模**：{target_str} ｜ **对标 OTC 锁价**：**`{otc_bp:.0f} bp` (全包净价)**",
-        "\n---\n### 一、🔥 盘面五项真实全链路成本 vs OTC 锁价对标（核心结论）",
+        "\n---\n### 一、🔥 盘面五项真实全链路成本 vs OTC 锁价对标（180m实盘K线 + L2逐档实测）",
         (
-            f"| 交易所 | ①静态表层 | ②做市商撤空退价 | ③HFT抢跑传染 | ④Taker费 | ⑤USDT换汇摩擦 | **盘面真实总成本** | **对比 OTC ({otc_bp:.0f}bp)** |\n"
+            f"| 交易所 | ①静态L2滑点 | ②K线冲击溢价(MM撤单) | ③Almgren-Chriss拆单风险 | ④Taker费 | ⑤USDT双腿实测 | **盘面真实总成本** | **对比 OTC ({otc_bp:.0f}bp)** |\n"
             "|---|---|---|---|---|---|---|---|"
         ),
     ]
@@ -321,8 +321,8 @@ def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
         lines.append(
             f"| **{r.exchange_label}** (`{r.symbol}`) | "
             f"`{b.static_slippage_bp:.1f}bp` (吃{r.levels_used}档) | "
-            f"**`+{b.mm_retreat_bp:.1f}bp`** | "
-            f"**`+{b.hft_frontrun_bp:.1f}bp`** | "
+            f"**`+{b.mm_retreat_bp:.1f}bp`** (`{b.order_to_1m_ofi_multiple:.1f}x` 1m净流) | "
+            f"**`+{b.hft_frontrun_bp:.1f}bp`** (拆单`{b.twap_exec_mins:.1f}m`) | "
             f"`+{b.taker_fee_bp:.1f}bp` | "
             f"`+{b.fiat_usdt_friction_bp:.1f}bp` | "
             f"**`{b.total_orderbook_cost_bp:.1f} bp` (`${b.total_orderbook_cost_usd:,.0f}`)** | "

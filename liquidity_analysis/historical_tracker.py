@@ -180,6 +180,82 @@ def fetch_kraken_tick_trades_since(
     return parsed, next_cursor
 
 
+def fetch_okx_historical_tick_trades(
+    inst_id: str = "BTC-USDT",
+    after_ts_ms: Optional[int] = None,
+    after_trade_id: Optional[str] = None,
+    limit: int = 100,
+    session: Optional[requests.Session] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch historical tick-by-tick trades from OKX (`GET /api/v5/market/history-trades`).
+    Supports:
+      - `type="2"` (timestamp pagination via `after=after_ts_ms`, up to ~90 days of tick history)
+      - `type="1"` (tradeId pagination via `after=after_trade_id`)
+    """
+    sess = session or requests.Session()
+    params: Dict[str, Any] = {"instId": inst_id, "limit": str(min(100, limit))}
+    if after_ts_ms is not None:
+        params["type"] = "2"
+        params["after"] = str(int(after_ts_ms))
+    elif after_trade_id is not None:
+        params["type"] = "1"
+        params["after"] = str(after_trade_id)
+    r = sess.get("https://www.okx.com/api/v5/market/history-trades", params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    out = []
+    for t in data:
+        p = float(t["px"])
+        q = float(t["sz"])
+        out.append({
+            "trade_id": str(t["tradeId"]),
+            "price": p,
+            "qty": q,
+            "quote_usd": p * q,
+            "ts_ms": int(t["ts"]),
+            "taker_side": str(t["side"]).upper(),
+        })
+    return out
+
+
+def fetch_coinbase_historical_tick_trades(
+    product_id: str = "BTC-USD",
+    after_trade_id: Optional[int] = None,
+    limit: int = 1000,
+    session: Optional[requests.Session] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch historical tick-by-tick trades from Coinbase (`GET /products/{id}/trades?after=<trade_id>`).
+    Supports paginating or binary-searching by `trade_id` all the way back to trade_id=1 (2015).
+    """
+    sess = session or requests.Session()
+    params: Dict[str, Any] = {"limit": min(1000, limit)}
+    if after_trade_id is not None:
+        params["after"] = str(int(after_trade_id))
+    r = sess.get(f"https://api.exchange.coinbase.com/products/{product_id}/trades", params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list):
+        return []
+    out = []
+    for t in data:
+        p = float(t["price"])
+        q = float(t["size"])
+        # Note: Coinbase `side` indicates the maker side ("buy" maker = SELL taker)
+        maker_side = str(t.get("side", "buy")).lower()
+        taker_side = "SELL" if maker_side == "buy" else "BUY"
+        out.append({
+            "trade_id": int(t["trade_id"]),
+            "price": p,
+            "qty": q,
+            "quote_usd": p * q,
+            "time_iso": str(t.get("time", "")),
+            "taker_side": taker_side,
+        })
+    return out
+
+
 def _parse_binance_raw_kline(b: list) -> Optional[Dict[str, Any]]:
     ts = int(b[0])
     o, h, l, c = float(b[1]), float(b[2]), float(b[3]), float(b[4])

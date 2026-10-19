@@ -104,6 +104,14 @@ class RealExecutionBreakdown:
     micro_order_pct: float = 0.0  # % of levels within 10bp that are <$5,000 HFT grid quotes
     usdt_book_slippage_bp: float = 0.0
     usdt_basis_bp: float = 0.0
+    permanent_impact_ratio: float = 0.55
+    ofi_autocorr: float = 0.0
+    mm_perp_hedge_floor_bp: float = 2.5
+    optimal_exec_mins: float = 2.0
+    slow_twap_mins: float = 15.0
+    strategy_sweep_1m_bp: float = 0.0
+    strategy_optimal_bp: float = 0.0
+    strategy_slow_twap_bp: float = 0.0
     data_source_note: str = "live_kline_and_l2_calibration"
 
 

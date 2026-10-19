@@ -579,7 +579,12 @@ def fetch_kline_microstructure(
 
     y_samples: List[float] = []
     lambda_samples: List[float] = []
+    perm_ratios: List[float] = []
+    signed_ofis: List[float] = []
+
     for b in bars:
+        s_ofi = b["net_ofi_usd"] if b["is_net_buy"] else -b["net_ofi_usd"]
+        signed_ofis.append(s_ofi)
         if b["o"] <= 0 or b["net_ofi_usd"] <= max(500.0, avg_ofi_1m * 0.2):
             continue
         adv_bp = (
@@ -589,18 +594,42 @@ def fetch_kline_microstructure(
         )
         if adv_bp <= 0.05:
             continue
+        close_disp_bp = abs(b["c"] - b["o"]) / b["o"] * 1e4
+        perm_ratios.append(min(1.0, close_disp_bp / adv_bp))
         ratio = b["net_ofi_usd"] / avg_ofi_1m
         if ratio > 0.1 and sigma_1m_bp > 0:
             y_samples.append(adv_bp / (sigma_1m_bp * math.sqrt(ratio)))
         lambda_samples.append(adv_bp / (b["net_ofi_usd"] / 1e6))
 
-    y_p75 = (
-        sorted(y_samples)[int(0.75 * len(y_samples))]
-        if y_samples
-        else 1.50
-    )
-    y_med = statistics.median(y_samples) if y_samples else 1.10
+    # Winsorized 75th-percentile Square-Root Impact Coefficient Y
+    if y_samples:
+        sy = sorted(y_samples)
+        y_p75 = min(2.50, max(1.00, sy[int(0.75 * len(sy))]))
+        y_med = statistics.median(sy)
+    else:
+        y_p75 = 1.50
+        y_med = 1.10
+
     lam_med = statistics.median(lambda_samples) if lambda_samples else 8.0
+    perm_ratio_med = (
+        max(0.35, min(0.75, statistics.median(perm_ratios)))
+        if perm_ratios
+        else 0.50
+    )
+
+    # First-order autocorrelation of signed OFI (measures order-flow clustering / VPIN toxicity)
+    ofi_autocorr = 0.0
+    if len(signed_ofis) >= 10:
+        x_s = signed_ofis[:-1]
+        y_s = signed_ofis[1:]
+        mx = statistics.mean(x_s)
+        my = statistics.mean(y_s)
+        num = sum((a - mx) * (b - my) for a, b in zip(x_s, y_s))
+        den = math.sqrt(
+            sum((a - mx) ** 2 for a in x_s) * sum((b - my) ** 2 for b in y_s)
+        )
+        if den > 0:
+            ofi_autocorr = max(-0.5, min(0.8, num / den))
 
     result = {
         "avg_1m_vol_usd": avg_vol_1m,
@@ -609,6 +638,8 @@ def fetch_kline_microstructure(
         "empirical_impact_y": y_p75,
         "empirical_impact_y_median": y_med,
         "kyle_lambda_bp_per_1m": lam_med,
+        "permanent_impact_ratio": perm_ratio_med,
+        "ofi_autocorr": ofi_autocorr,
         "bars_sampled": len(bars),
     }
     _KLINE_CACHE[cache_key] = (now, result)

@@ -105,6 +105,7 @@ class LiquidityBotHandlers:
                     default_currency=str(av.get("currency") or "USD"),
                     default_amount=str(av.get("notional") or "1000000"),
                     default_exchange=str(av.get("exchange") or "binance,okx"),
+                    default_otc_bp=str(av.get("otc_quote_bp") or "30"),
                 )
                 return self._card_response(card, P2CardActionTriggerResponse)
 
@@ -119,7 +120,7 @@ class LiquidityBotHandlers:
                             notional=params["notional"],
                             currency=params["currency"],
                             exchanges=params["exchanges"],
-                            taker_fee_bp=DEFAULT_TAKER_FEE_BP,
+                            otc_quote_bp=params["otc_quote_bp"],
                         )
                         res_card = build_result_card(results)
                         self._send_to_user(open_id, res_card)

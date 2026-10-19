@@ -2,15 +2,8 @@
 """
 Lark (飞书) Interactive Card (Schema 2.0) builder and callback payload processor.
 
-Designed specifically for interactive selection inside Lark:
-  1. Symbol Selection: Dropdown of preset coins (BTC, ETH, Solana, etc.) + optional custom input box
-  2. Direction Selection: BUY (买入吃卖盘) / SELL (卖出吃买盘)
-  3. Currency Selection: USD (美金) / HKD (港币)
-  4. Amount Selection: Quick-select notional dropdown (50万 / 100万 / 200万 / 500万 / 1000万 / 1500万)
-     + optional custom amount input box
-  5. Exchange Selection: Binance vs OKX (default highlight), All 5 exchanges, or single exchange
-  6. Result Card: Shows Level-1 screen price illusion, levels eaten, extra cost per coin vs Level 1,
-     total slippage loss, OTC Block Trade pitch, and one-click buttons to re-query or verify Maker orders.
+Includes full 5-component realistic Market Maker withdrawal + price retreat + HFT front-running
++ Taker fee + Fiat/USDT friction breakdown benchmarked directly against the OTC Block Trade quote (e.g. 30 bp).
 """
 
 from __future__ import annotations
@@ -18,21 +11,18 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .engine import (
-    DEFAULT_TAKER_FEE_BP,
+    DEFAULT_OTC_QUOTE_BP,
     build_otc_pitch_lines,
     compare_exchanges,
-    verify_orderbook,
 )
 from .exchanges import SUPPORTED_EXCHANGES
 from .models import SlippageResult, VerificationReport
 from .symbols import PRESET_ASSETS, parse_amount
 
-# Callback action identifiers
 ACTION_SUBMIT_QUERY = "submit_slippage_query"
 ACTION_OPEN_QUERY_FORM = "open_query_form"
 ACTION_VERIFY_MAKER = "verify_maker_orders"
 
-# Form field names
 F_PRESET_SYMBOL = "preset_symbol"
 F_CUSTOM_SYMBOL = "custom_symbol"
 F_SIDE = "side"
@@ -40,6 +30,7 @@ F_CURRENCY = "currency"
 F_PRESET_NOTIONAL = "preset_notional"
 F_CUSTOM_NOTIONAL = "custom_notional"
 F_EXCHANGE = "exchange"
+F_OTC_QUOTE_BP = "otc_quote_bp"
 
 PRESET_NOTIONAL_OPTIONS: List[tuple[str, str]] = [
     ("500,000 (50万)", "500000"),
@@ -48,6 +39,14 @@ PRESET_NOTIONAL_OPTIONS: List[tuple[str, str]] = [
     ("5,000,000 (500万)", "5000000"),
     ("10,000,000 (1000万)", "10000000"),
     ("15,000,000 (1500万)", "15000000"),
+]
+
+OTC_QUOTE_BP_OPTIONS: List[tuple[str, str]] = [
+    ("20 bp (0.20% VIP 大宗报价)", "20"),
+    ("25 bp (0.25% 优惠报价)", "25"),
+    ("30 bp (0.30% 标准 OTC 报价)", "30"),
+    ("35 bp (0.35% 报价)", "35"),
+    ("40 bp (0.40% 报价)", "40"),
 ]
 
 
@@ -99,7 +98,6 @@ def _input(
 
 
 def _submit_button(name: str, action: str, text: str) -> Dict[str, Any]:
-    """Lark Card Schema 2.0 form submit button (`form_action_type: submit`)."""
     return {
         "tag": "button",
         "name": name,
@@ -161,15 +159,9 @@ def build_query_card(
     default_currency: str = "USD",
     default_amount: str = "1000000",
     default_exchange: str = "binance,okx",
+    default_otc_bp: str = "30",
 ) -> Dict[str, Any]:
-    """
-    Generate Lark Schema 2.0 interactive form card for selecting:
-      - Symbol (dropdown + optional custom input)
-      - Side (Buy / Sell)
-      - Currency (USD / HKD)
-      - Amount (preset dropdown + optional custom input)
-      - Exchanges (Binance vs OKX, All 5 exchanges, or individual exchange)
-    """
+    """Generate Lark Schema 2.0 interactive form card."""
     symbol_choices = [(item["label"], item["value"]) for item in PRESET_ASSETS]
 
     exchange_choices: List[tuple[str, str]] = [
@@ -189,20 +181,24 @@ def build_query_card(
     init_sym = default_symbol.upper() if default_symbol.upper() in preset_sym_values else "BTC"
     init_custom_sym = "" if default_symbol.upper() in preset_sym_values else default_symbol
 
+    otc_vals = {v for _, v in OTC_QUOTE_BP_OPTIONS}
+    init_otc = default_otc_bp if default_otc_bp in otc_vals else "30"
+
     return {
         "schema": "2.0",
         "header": {
             "template": "blue",
             "title": {
                 "tag": "plain_text",
-                "content": "📊 OTC Block Trade vs 交易所盘口滑点测算",
+                "content": "📊 OTC Block Trade vs 交易所盘口真实冲击测算",
             },
         },
         "body": {
             "elements": [
                 _text(
-                    "在下方选择**币对**、**方向**、**美金/港币金额**与**对比交易所**，"
-                    "实时测算盘面扫单需**吃穿多少档**、**平均价格比第 1 档额外贵多少**，突出 **OTC Block Trade 一口价优势**。"
+                    "选择**币对**、**方向**、**美金/港币金额**与**OTC 报价点数（如 30bp）**，"
+                    "实时还原**大单触发做市商毫秒级撤空退价（MM Retreat）+ HFT 抢跑 + Taker 费 + USDT 换汇损耗**，"
+                    "用真实微观结构数据证明 **OTC 一口价锁死比盘面更划算**。"
                 ),
                 {
                     "tag": "form",
@@ -261,10 +257,17 @@ def build_query_card(
                             exchange_choices,
                             initial_option=default_exchange,
                         ),
+                        _text("**6. 对标 OTC 报价点数 (默认 30 bp 全包一口价)**"),
+                        _select(
+                            F_OTC_QUOTE_BP,
+                            "选择 OTC 报价点数",
+                            OTC_QUOTE_BP_OPTIONS,
+                            initial_option=init_otc,
+                        ),
                         _submit_button(
                             "submit_slippage_btn",
                             ACTION_SUBMIT_QUERY,
-                            "📊 立即测算 (生成 OTC vs 盘面对比报告)",
+                            "📊 立即测算 (还原做市商撤单退价 vs OTC 30bp 对标)",
                         ),
                     ],
                 },
@@ -274,7 +277,7 @@ def build_query_card(
 
 
 def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
-    """Render a list of `SlippageResult` into a Lark Schema 2.0 Card highlighting OTC Block Trade advantage."""
+    """Render a list of `SlippageResult` into a Lark Schema 2.0 Card proving OTC Block Trade advantage."""
     if not results:
         return error_card("未获取到任何交易所盘口数据，请检查币对名称或重试。")
 
@@ -283,6 +286,7 @@ def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
     worse_label = "比1档多付" if first.side == "buy" else "比1档少收"
     ccy = first.input_currency
     ccy_prefix = "HK$" if ccy == "HKD" else "$"
+    otc_bp = first.real_breakdown.otc_quote_bp if first.real_breakdown else DEFAULT_OTC_QUOTE_BP
 
     if first.target_notional_input is not None:
         target_str = (
@@ -294,56 +298,62 @@ def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
 
     lines: List[str] = [
         f"**标的**：`{first.base_asset}` ｜ **方向**：{side_cn}",
-        f"**目标规模**：{target_str} ｜ **参考汇率**：`1 USD = {first.fx_usd_hkd:.4f} HKD`",
-        "\n---\n### 一、各交易所盘面直扫穿透明细（对比第 1 档屏幕价）",
+        f"**目标规模**：{target_str} ｜ **对标 OTC 锁价**：**`{otc_bp:.0f} bp` (全包净价)**",
+        "\n---\n### 一、🔥 盘面五项真实全链路成本 vs OTC 锁价对标（核心结论）",
         (
-            f"| 交易所 | 第1档价 (仅能满足%) | 吃穿档数 | 成交均价 VWAP | 每颗{first.base_asset}{worse_label} | 尾档价 ({worse_label}) | 仅滑点损耗 | 含Taker费全口径损耗 |\n"
+            f"| 交易所 | ①静态表层 | ②做市商撤空退价 | ③HFT抢跑传染 | ④Taker费 | ⑤USDT换汇摩擦 | **盘面真实总成本** | **对比 OTC ({otc_bp:.0f}bp)** |\n"
             "|---|---|---|---|---|---|---|---|"
         ),
     ]
 
     for r in results:
-        if r.error:
+        if r.error or not r.real_breakdown:
             lines.append(
                 f"| **{r.exchange_label}** (`{r.symbol}`) | - | - | - | - | - | - | ❌ 失败 |"
             )
             continue
-        lvl_str = (
-            f"**{r.levels_used} 档**"
-            if not r.depth_exhausted
-            else f"⚠️ **{r.levels_used} 档** (仅成交{r.fill_ratio*100:.0f}%)"
+        b = r.real_breakdown
+        save_str = (
+            f"✅ **OTC 净省 {b.otc_savings_bp:.1f}bp (`${b.otc_savings_usd:,.0f}`)**"
+            if b.otc_savings_bp > 0
+            else f"⚠️ 接近 OTC (`{b.total_orderbook_cost_bp:.1f}bp`)"
         )
         lines.append(
             f"| **{r.exchange_label}** (`{r.symbol}`) | "
-            f"`${r.top_price_usd:,.2f}` ({r.level1_fill_pct:.1f}%) | "
-            f"{lvl_str} | "
-            f"`${r.vwap_usd:,.2f}` | "
-            f"**`+${r.vwap_extra_per_coin_usd:,.2f}/{r.base_asset}`** (+{r.vwap_slippage_bp:.2f}bp) | "
-            f"`${r.last_price_usd:,.2f}` (+${r.last_extra_per_coin_usd:,.2f}) | "
-            f"`${r.slippage_loss_usd:,.2f}` | "
-            f"**`${r.all_in_loss_usd:,.2f}`** (+{r.all_in_cost_bp:.2f}bp) |"
+            f"`{b.static_slippage_bp:.1f}bp` (吃{r.levels_used}档) | "
+            f"**`+{b.mm_retreat_bp:.1f}bp`** | "
+            f"**`+{b.hft_frontrun_bp:.1f}bp`** | "
+            f"`+{b.taker_fee_bp:.1f}bp` | "
+            f"`+{b.fiat_usdt_friction_bp:.1f}bp` | "
+            f"**`{b.total_orderbook_cost_bp:.1f} bp` (`${b.total_orderbook_cost_usd:,.0f}`)** | "
+            f"{save_str} |"
         )
 
-    valid_with_fade = [r for r in results if not r.error and r.fade_scenarios]
-    if valid_with_fade:
+    lines.extend(
+        [
+            "\n---\n### 二、📊 静态表层 vs 做市商撤单退价后每颗币额外差价（vs 第 1 档屏幕价）",
+            (
+                f"| 交易所 | 第1档价 (仅能满足%) | 静态理想 (0%撤单) | 常规HFT撤单+退价 | 剧烈撤单+HFT抢跑 | 盘面真实全包均价 |\n"
+                "|---|---|---|---|---|---|"
+            ),
+        ]
+    )
+
+    for r in results:
+        if r.error or not r.fade_scenarios or not r.real_breakdown:
+            continue
+        s0 = r.fade_scenarios[0]
+        s50 = r.fade_scenarios[1] if len(r.fade_scenarios) > 1 else s0
+        s70 = r.fade_scenarios[2] if len(r.fade_scenarios) > 2 else s0
+        b = r.real_breakdown
         lines.append(
-            "\n---\n### 二、⚡ 大单引发做市商瞬时撤单 (Quote Fading) 压力测试"
+            f"| **{r.exchange_label}** | "
+            f"`${r.top_price_usd:,.2f}` ({r.level1_fill_pct:.1f}%) | "
+            f"吃{s0.levels_used}档 / `+${s0.vwap_extra_per_coin_usd:,.2f}` ({s0.vwap_slippage_bp:.1f}bp) | "
+            f"吃{s50.levels_used}档 / **`+${s50.vwap_extra_per_coin_usd:,.2f}`** ({s50.vwap_slippage_bp:.1f}bp) | "
+            f"吃{s70.levels_used}档 / **`+${s70.vwap_extra_per_coin_usd:,.2f}`** ({s70.vwap_slippage_bp:.1f}bp) | "
+            f"**`${b.realistic_all_in_vwap_usd:,.2f}`** ({worse_label} **`+${b.realistic_extra_per_coin_usd:,.2f}/{r.base_asset}`**) |"
         )
-        lines.append(
-            "| 交易所 | 0%撤单 (静态理想) | 50%撤单 (常规HFT退避) | 70%撤单 (剧烈/跨所撤单) | 撤单滑点放大倍数 |\n"
-            "|---|---|---|---|---|"
-        )
-        for r in valid_with_fade:
-            s0 = r.fade_scenarios[0]
-            s50 = next((s for s in r.fade_scenarios if abs(s.fade_rate - 0.50) < 1e-6), s0)
-            s70 = next((s for s in r.fade_scenarios if abs(s.fade_rate - 0.70) < 1e-6), s0)
-            lines.append(
-                f"| **{r.exchange_label}** | "
-                f"吃 **{s0.levels_used}档** / `+${s0.vwap_extra_per_coin_usd:,.2f}` (+{s0.vwap_slippage_bp:.2f}bp) | "
-                f"吃 **{s50.levels_used}档** / **`+${s50.vwap_extra_per_coin_usd:,.2f}`** (+{s50.vwap_slippage_bp:.2f}bp, 损`${s50.slippage_loss_usd:,.0f}`) | "
-                f"吃 **{s70.levels_used}档** / **`+${s70.vwap_extra_per_coin_usd:,.2f}`** (+{s70.vwap_slippage_bp:.2f}bp, 损`${s70.slippage_loss_usd:,.0f}`) | "
-                f"**{s50.amplification_vs_static:.1f}x ~ {s70.amplification_vs_static:.1f}x** |"
-            )
 
     pitch_lines = build_otc_pitch_lines(results)
     if pitch_lines:
@@ -360,7 +370,7 @@ def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
             "template": "turquoise",
             "title": {
                 "tag": "plain_text",
-                "content": f"📈 {first.base_asset} ({first.side.upper()}) 盘面吃单 vs OTC Block Trade 分析报告",
+                "content": f"📈 {first.base_asset} ({first.side.upper()}) 盘面真实全链路成本 vs OTC {otc_bp:.0f}bp 报告",
             },
         },
         "body": {
@@ -375,6 +385,7 @@ def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
                         "currency": first.input_currency,
                         "notional": amt_str,
                         "exchange": ex_str,
+                        "otc_quote_bp": str(int(otc_bp)),
                     },
                     primary=True,
                 ),
@@ -469,7 +480,6 @@ def parse_lark_form_params(form_value: Dict[str, Any]) -> Dict[str, Any]:
 
     custom_notional = _select_val(form_value.get(F_CUSTOM_NOTIONAL)).strip()
     preset_notional = _select_val(form_value.get(F_PRESET_NOTIONAL)).strip()
-    # Also support legacy `notional` key
     legacy_notional = _select_val(form_value.get("notional")).strip()
     raw_notional = custom_notional or legacy_notional or preset_notional or "1000000"
     notional = parse_amount(raw_notional)
@@ -481,6 +491,9 @@ def parse_lark_form_params(form_value: Dict[str, Any]) -> Dict[str, Any]:
         else [x.strip() for x in exchange_sel.split(",") if x.strip()]
     )
 
+    otc_raw = _select_val(form_value.get(F_OTC_QUOTE_BP)).strip()
+    otc_quote_bp = float(otc_raw) if otc_raw else DEFAULT_OTC_QUOTE_BP
+
     return {
         "symbol": symbol,
         "side": side,
@@ -488,6 +501,7 @@ def parse_lark_form_params(form_value: Dict[str, Any]) -> Dict[str, Any]:
         "notional": notional,
         "exchanges": exchanges,
         "exchange_sel": exchange_sel,
+        "otc_quote_bp": otc_quote_bp,
     }
 
 
@@ -500,6 +514,6 @@ def handle_lark_form_submit(form_value: Dict[str, Any]) -> Dict[str, Any]:
         notional=params["notional"],
         currency=params["currency"],
         exchanges=params["exchanges"],
-        taker_fee_bp=DEFAULT_TAKER_FEE_BP,
+        otc_quote_bp=params["otc_quote_bp"],
     )
     return build_result_card(results)

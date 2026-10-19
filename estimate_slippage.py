@@ -3,17 +3,7 @@
 """
 estimate_slippage.py
 ====================
-多交易所盘口流动性分析、滑点估算与 OTC Block Trade 优势对比工具
-
-核心功能:
-  1. 币对支持: 预设下拉菜单 (BTC, ETH, Solana/SOL 等) + 任意自定义币对输入
-  2. 金额支持: 美金 (USD) 或港币 (HKD)，支持 1000000 / 1M / 100万 / 1000万 等简写
-  3. 交易所支持: Binance, OKX, Coinbase, Kraken, HashKey HK (USD & HKD), HashKey Global, Bybit
-  4. OTC Block Trade 专项对比分析:
-     - 揭露「第 1 档屏幕价假象」: 展示第 1 档挂单金额及仅占目标订单的百分比
-     - 穿透档数: 展示吃掉多少档 (`levels_used`)
-     - 额外价差: 展示平均成交价 (VWAP) 与最后一口价相对第 1 档每颗币额外多付多少美金/港币 (`+$XX.XX/币`)
-     - 全口径损耗: 汇总静态滑点损失金额 + 交易所 Taker 吃单费，自动生成面向客户的 OTC 对比话术
+多交易所盘口流动性分析、做市商动态撤单退价模拟与 OTC Block Trade (30bp) 价值对标工具
 """
 
 import argparse
@@ -22,7 +12,7 @@ import sys
 from typing import List, Optional
 
 from liquidity_analysis.engine import (
-    DEFAULT_TAKER_FEE_BP,
+    DEFAULT_OTC_QUOTE_BP,
     build_otc_pitch_lines,
     compare_exchanges,
     estimate_single,
@@ -36,7 +26,6 @@ from liquidity_analysis.lark_card import build_query_card, build_result_card
 from liquidity_analysis.models import SlippageResult, VerificationReport
 from liquidity_analysis.symbols import PRESET_ASSETS, parse_amount
 
-# 2026-10-05 BTC/USDT 买盘截图(从上到下): (数量, 价格) — 保留原版静态复核样本
 SCREENSHOT_BIDS = [
     (1.23548, 86055.48), (0.00066, 86055.47), (0.00014, 86054.55),
     (0.03618, 86054.54), (0.11866, 86054.53), (0.00007, 86054.29),
@@ -65,64 +54,7 @@ def demo_screenshot():
 
 
 def _print_single_result(r: SlippageResult) -> None:
-    ccy = r.input_currency
-    worse_word = "多付" if r.side == "buy" else "少收"
-    if r.target_notional_input is not None:
-        prefix = "HK$" if ccy == "HKD" else "$"
-        target_txt = (
-            f"{prefix}{r.target_notional_input:,.2f} {ccy} "
-            f"(≈ ${r.target_notional_usd:,.2f} USD / HK${r.target_notional_hkd:,.2f} HKD)"
-        )
-    else:
-        target_txt = f"{r.target_qty:,.4f} {r.base_asset}"
-
-    print(
-        f"交易所: {r.exchange_label} ({r.exchange})  交易对: {r.symbol}  "
-        f"方向: {r.side.upper()}  目标: {target_txt}"
-    )
-    print(
-        f"第 1 档最优价(top): ${r.top_price_usd:,.2f} USD (HK${r.top_price_hkd:,.2f} HKD) | "
-        f"第 1 档仅挂单: {r.level1_qty:,.4f} {r.base_asset} (${r.level1_notional_usd:,.0f} USD, "
-        f"仅够满足本单 {r.level1_fill_pct:.1f}%)"
-    )
-    print(
-        f"同侧盘口总额: ${r.book_side_total_usd:,.0f} USD / HK${r.book_side_total_hkd:,.0f} HKD "
-        f"({r.book_levels} 档, 共 {r.book_side_total_qty:,.4f} {r.base_asset})"
-    )
-    status_str = (
-        "100% 全部成交"
-        if not r.depth_exhausted
-        else f"⚠️ 盘口深度耗尽 (仅成交 {r.fill_ratio * 100:.2f}%)"
-    )
-    print(f"吃掉档位数: {r.levels_used} 档 ({status_str})")
-    print(
-        f"实际成交: {r.filled_qty:,.4f} {r.base_asset} / "
-        f"${r.cost_usd:,.2f} USD (HK${r.cost_hkd:,.2f} HKD)"
-    )
-    print(
-        f"成交均价 VWAP: ${r.vwap_usd:,.2f} USD (HK${r.vwap_hkd:,.2f} HKD)  "
-        f"→ 比第 1 档每颗 {r.base_asset} 额外{worse_word} +${r.vwap_extra_per_coin_usd:,.2f} "
-        f"(+HK${r.vwap_extra_per_coin_hkd:,.2f}, 滑点 +{r.vwap_slippage_bp:.2f} bp)"
-    )
-    print(
-        f"最后一口成交价: ${r.last_price_usd:,.2f} USD (HK${r.last_price_hkd:,.2f} HKD)  "
-        f"→ 比第 1 档每颗 {r.base_asset} 额外{worse_word} +${r.last_extra_per_coin_usd:,.2f} "
-        f"(+HK${r.last_extra_per_coin_hkd:,.2f}, 滑点 +{r.last_slippage_bp:.2f} bp)"
-    )
-    print(
-        f"盘面直扫额外损耗: 仅滑点{worse_word} ${r.slippage_loss_usd:,.2f} USD (HK${r.slippage_loss_hkd:,.0f} HKD) | "
-        f"含 {r.taker_fee_bp:.0f}bp Taker 费全口径{worse_word} ${r.all_in_loss_usd:,.2f} USD "
-        f"(+{r.all_in_cost_bp:.2f} bp, 等效全包均价 ${r.all_in_vwap_usd:,.2f})"
-    )
-    if r.depth_bands:
-        bands_str = " | ".join(
-            f"±{int(b.bp)}bp: ${b.cum_usd:,.0f} ({b.cum_qty:,.2f} {r.base_asset})"
-            for b in r.depth_bands
-        )
-        print(f"盘口深度阶梯: {bands_str}")
-    print("\n--- 💡 OTC Block Trade 对比话术 ---")
-    for line in build_otc_pitch_lines([r]):
-        print(line)
+    _print_comparison_table([r])
 
 
 def _print_comparison_table(results: List[SlippageResult]) -> None:
@@ -132,6 +64,7 @@ def _print_comparison_table(results: List[SlippageResult]) -> None:
 
     first = results[0]
     ccy = first.input_currency
+    otc_bp = first.real_breakdown.otc_quote_bp if first.real_breakdown else DEFAULT_OTC_QUOTE_BP
     if first.target_notional_input is not None:
         prefix = "HK$" if ccy == "HKD" else "$"
         target_txt = (
@@ -141,64 +74,65 @@ def _print_comparison_table(results: List[SlippageResult]) -> None:
     else:
         target_txt = f"{first.target_qty:,.4f} {first.base_asset}"
 
-    print("=" * 136)
+    print("=" * 142)
     print(
-        f"📊 盘面直扫 vs OTC Block Trade 穿透对比 | 标的: {first.base_asset} | 方向: {first.side.upper()} | "
-        f"目标: {target_txt} | 汇率: {first.fx_usd_hkd:.4f} HKD/USD"
+        f"🔥 盘面真实全链路执行成本 vs OTC Block Trade ({otc_bp:.0f}bp 一口价) 深度对标 | "
+        f"标的: {first.base_asset} | 方向: {first.side.upper()} | 目标: {target_txt}"
     )
-    print("=" * 136)
-    header = (
-        f"{'交易所':<18} {'交易对':<9} {'1档价(USD)':>12} {'1档仅够%':>8} "
-        f"{'吃穿档数':>8} {'VWAP均价(USD)':>14} {'每币比1档贵':>14} "
-        f"{'尾档比1档贵':>14} {'仅滑点多花':>12} {'含费全口径损耗':>16}"
+    print("=" * 142)
+    print(
+        f"{'交易所':<16} {'交易对':<9} {'1档价(仅够%)':>18} {'①静态表层':>12} "
+        f"{'②MM撤空退价':>12} {'③HFT抢跑':>10} {'④Taker费':>9} {'⑤USDT换汇':>10} "
+        f"{'盘面真实总成本':>18} {'对比 OTC (' + str(int(otc_bp)) + 'bp)':>20}"
     )
-    print(header)
-    print("-" * 136)
+    print("-" * 142)
 
     for r in results:
-        if r.error:
-            print(
-                f"{r.exchange_label:<18} {r.symbol:<9} {'-':>12} {'-':>8} "
-                f"{'-':>8} {'-':>14} {'-':>14} {'-':>14} {'-':>12} ❌ {r.error[:24]}"
-            )
+        if r.error or not r.real_breakdown:
+            print(f"{r.exchange_label:<16} {r.symbol:<9} ❌ {r.error}")
             continue
-        lvl_txt = (
-            f"{r.levels_used}档"
-            if not r.depth_exhausted
-            else f"{r.levels_used}档(耗尽)"
-        )
-        vwap_extra_txt = f"+${r.vwap_extra_per_coin_usd:,.2f} ({r.vwap_slippage_bp:.1f}bp)"
-        last_extra_txt = f"+${r.last_extra_per_coin_usd:,.2f} ({r.last_slippage_bp:.1f}bp)"
-        all_in_txt = f"${r.all_in_loss_usd:,.0f} (+{r.all_in_cost_bp:.1f}bp)"
+        b = r.real_breakdown
+        l1_txt = f"${r.top_price_usd:,.0f} ({r.level1_fill_pct:.1f}%)"
+        s1_txt = f"{b.static_slippage_bp:.1f}bp({r.levels_used}档)"
+        s2_txt = f"+{b.mm_retreat_bp:.1f}bp"
+        s3_txt = f"+{b.hft_frontrun_bp:.1f}bp"
+        s4_txt = f"+{b.taker_fee_bp:.1f}bp"
+        s5_txt = f"+{b.fiat_usdt_friction_bp:.1f}bp"
+        tot_txt = f"{b.total_orderbook_cost_bp:.1f}bp (${b.total_orderbook_cost_usd:,.0f})"
+        if b.otc_savings_bp > 0:
+            vs_txt = f"OTC省 {b.otc_savings_bp:.1f}bp (${b.otc_savings_usd:,.0f})"
+        else:
+            vs_txt = f"差 {b.otc_savings_bp:.1f}bp"
         print(
-            f"{r.exchange_label:<18} {r.symbol:<9} "
-            f"${r.top_price_usd:>11,.2f} {r.level1_fill_pct:>7.1f}% "
-            f"{lvl_txt:>8} ${r.vwap_usd:>13,.2f} {vwap_extra_txt:>14} "
-            f"{last_extra_txt:>14} ${r.slippage_loss_usd:>11,.2f} {all_in_txt:>16}"
+            f"{r.exchange_label:<16} {r.symbol:<9} {l1_txt:>18} {s1_txt:>12} "
+            f"{s2_txt:>12} {s3_txt:>10} {s4_txt:>9} {s5_txt:>10} "
+            f"{tot_txt:>18} {vs_txt:>20}"
         )
 
-    valid_with_fade = [r for r in results if not r.error and r.fade_scenarios]
+    valid_with_fade = [r for r in results if not r.error and r.fade_scenarios and r.real_breakdown]
     if valid_with_fade:
-        print("-" * 136)
-        print("⚡ 【大单引发做市商瞬时撤单 (Market Maker Quote Fading) 压力测试】")
+        print("-" * 142)
+        print("⚡ 【不同做市商撤单/退价情景下的盘面穿透与每颗币额外加价（相对屏幕第 1 档）】")
         for r in valid_with_fade:
             s0 = r.fade_scenarios[0]
-            s50 = next((s for s in r.fade_scenarios if abs(s.fade_rate - 0.50) < 1e-6), s0)
-            s70 = next((s for s in r.fade_scenarios if abs(s.fade_rate - 0.70) < 1e-6), s0)
+            s50 = r.fade_scenarios[1]
+            s70 = r.fade_scenarios[2]
+            b = r.real_breakdown
+            assert b is not None
             print(
                 f"  • {r.exchange_label:<12} | "
-                f"0%撤单(静态): 吃{s0.levels_used:>3}档, 比1档贵 +${s0.vwap_extra_per_coin_usd:>6,.2f}/{r.base_asset} (+{s0.vwap_slippage_bp:>5.2f}bp)  ==>  "
-                f"50%撤单: 吃{s50.levels_used:>3}档, 贵 +${s50.vwap_extra_per_coin_usd:>6,.2f} (+{s50.vwap_slippage_bp:>5.2f}bp, 放大{s50.amplification_vs_static:.1f}x)  ==>  "
-                f"70%撤单: 吃{s70.levels_used:>3}档, 贵 +${s70.vwap_extra_per_coin_usd:>6,.2f} (+{s70.vwap_slippage_bp:>5.2f}bp, 放大{s70.amplification_vs_static:.1f}x)"
+                f"静态理想(0%撤): 吃{s0.levels_used:>3}档, 贵+${s0.vwap_extra_per_coin_usd:>6,.2f}/{r.base_asset} ({s0.vwap_slippage_bp:>4.1f}bp)  ==>  "
+                f"MM撤空退价: 吃{s50.levels_used:>3}档, 贵+${s50.vwap_extra_per_coin_usd:>6,.2f} ({s50.vwap_slippage_bp:>4.1f}bp)  ==>  "
+                f"全链路落地均价: ${b.realistic_all_in_vwap_usd:,.2f} (比1档贵 +${b.realistic_extra_per_coin_usd:,.2f}/{r.base_asset}, 共 {b.total_orderbook_cost_bp:.1f}bp)"
             )
 
-    print("-" * 136)
+    print("-" * 142)
     pitch_lines = build_otc_pitch_lines(results)
     if pitch_lines:
         print("💡 【OTC Block Trade 客户对比分析结论（可直接复制发送）】")
         for line in pitch_lines:
             print(line)
-    print("=" * 136)
+    print("=" * 142)
 
 
 def _print_verification_report(rep: VerificationReport) -> None:
@@ -256,7 +190,7 @@ def _print_verification_report(rep: VerificationReport) -> None:
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
-        description="多交易所现货盘口流动性、滑点估算与 OTC Block Trade 对比分析工具"
+        description="多交易所现货盘口流动性、做市商动态撤单退价模拟与 OTC Block Trade 对比分析工具"
     )
     ap.add_argument(
         "--symbol",
@@ -298,8 +232,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument(
         "--taker-fee-bp",
         type=float,
-        default=DEFAULT_TAKER_FEE_BP,
-        help=f"盘面 Taker 吃单手续费率 (bp), 用于计算全口径盘面成本, 默认 {DEFAULT_TAKER_FEE_BP} bp",
+        default=None,
+        help="手动指定盘面 Taker 吃单手续费率 (bp)，默认按各交易所真实费率 (Binance/OKX 10bp, Coinbase 15bp 等)",
+    )
+    ap.add_argument(
+        "--otc-quote-bp",
+        type=float,
+        default=DEFAULT_OTC_QUOTE_BP,
+        help=f"对标的 OTC Block Trade 一口价报价点数 (bp), 默认 {DEFAULT_OTC_QUOTE_BP} bp",
     )
     ap.add_argument(
         "--fx-rate",
@@ -365,6 +305,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             default_side=args.side,
             default_currency=args.currency.upper(),
             default_amount=args.notional or "1000000",
+            default_otc_bp=str(int(args.otc_quote_bp)),
         )
         print(json.dumps(card, indent=2, ensure_ascii=False))
         return 0
@@ -416,6 +357,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             limit=args.limit,
             fx_rate=args.fx_rate,
             taker_fee_bp=args.taker_fee_bp,
+            otc_quote_bp=args.otc_quote_bp,
         )
         if args.lark_card == "result":
             print(json.dumps(build_result_card(results), indent=2, ensure_ascii=False))
@@ -435,7 +377,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             _print_comparison_table(results)
         return 0
 
-    # Single-exchange mode
     try:
         r = estimate_single(
             exchange=ex_raw,
@@ -447,6 +388,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             limit=args.limit,
             fx_rate=args.fx_rate,
             taker_fee_bp=args.taker_fee_bp,
+            otc_quote_bp=args.otc_quote_bp,
             allow_partial=False,
         )
     except RuntimeError as e:

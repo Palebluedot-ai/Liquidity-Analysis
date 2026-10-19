@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Data models for multi-exchange order book depth, slippage estimation, Maker withdrawal simulation, and verification."""
+"""Data models for multi-exchange order book depth, realistic MM withdrawal & full-chain execution cost, and OTC comparison."""
 
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,12 +21,11 @@ class DepthBand:
 @dataclass
 class FadeScenario:
     """
-    Simulated execution outcome when Market Makers pull `fade_rate` (e.g. 50% or 70%)
-    of resting liquidity after the initial fill / across child sweeps.
+    Simulated execution outcome under a specific Market Maker withdrawal / retreat regime.
     """
 
-    fade_rate: float  # 0.0 ~ 0.90 (e.g. 0.50 = 50% of deeper maker orders cancelled)
-    label: str  # e.g. "静态理想 (0%撤单)", "常规HFT撤单 (50%撤单)", "剧烈联动撤单 (70%撤单)"
+    fade_rate: float
+    label: str
     levels_used: int
     filled_qty: float
     fill_ratio: float
@@ -45,7 +44,53 @@ class FadeScenario:
     all_in_cost_bp: float
     all_in_loss_usd: float
     all_in_loss_hkd: float
-    amplification_vs_static: float  # Multiple of static slippage bp (e.g. 2.4x)
+    amplification_vs_static: float
+
+
+@dataclass
+class RealExecutionBreakdown:
+    """
+    Full-chain realistic order-book execution cost breakdown vs. OTC Block Trade quote.
+
+    Why static order book slippage (1~3 bp) is an illusion for large orders:
+      1. `static_slippage_bp`: Walking resting quotes as if HFTs stand still.
+      2. `mm_retreat_bp`: Market Maker Cancel-All & Price Retreat (after first ~$100k-$150k probe
+         is hit, VPIN/OFI toxicity triggers mass-cancel of the near book and shifts quotes wider).
+      3. `hft_frontrun_bp`: Predatory HFT momentum ignition / cross-exchange sniping triggered by
+         the first sweep wave's public trade print.
+      4. `taker_fee_bp`: Exchange Taker execution fee (8~10 bp on Binance/OKX, 12~20 bp on fiat exchanges).
+      5. `fiat_usdt_friction_bp`: Fiat (USD/HKD) <-> USDT conversion spread, fee & stablecoin basis
+         (applies when executing USD/HKD capital on a USDT-quoted book like Binance/OKX).
+    """
+
+    # 5 cost components in basis points (bp)
+    static_slippage_bp: float
+    mm_retreat_bp: float
+    hft_frontrun_bp: float
+    taker_fee_bp: float
+    fiat_usdt_friction_bp: float
+
+    # Totals for realistic order-book execution
+    total_orderbook_cost_bp: float
+    total_orderbook_cost_usd: float
+    total_orderbook_cost_hkd: float
+    realistic_all_in_vwap_usd: float
+    realistic_all_in_vwap_hkd: float
+    realistic_extra_per_coin_usd: float
+    realistic_extra_per_coin_hkd: float
+    estimated_waves: int  # Number of child bursts / waves before completion
+    probe_depth_usd: float  # Top-of-book probe liquidity before MM toxicity trigger (~5bp band)
+
+    # Benchmark against OTC Block Trade quote (e.g. 30 bp all-in net price)
+    otc_quote_bp: float
+    otc_cost_usd: float
+    otc_cost_hkd: float
+    otc_all_in_price_usd: float
+    otc_all_in_price_hkd: float
+    otc_savings_bp: float  # total_orderbook_cost_bp - otc_quote_bp (positive = OTC saves money)
+    otc_savings_usd: float
+    otc_savings_hkd: float
+    otc_savings_per_coin_usd: float
 
 
 @dataclass
@@ -100,28 +145,28 @@ class SlippageResult:
 
     # Input specification
     input_currency: str  # "USD" or "HKD"
-    target_notional_input: Optional[float]  # Target in input_currency (if notional mode)
+    target_notional_input: Optional[float]
     target_notional_usd: Optional[float]
     target_notional_hkd: Optional[float]
-    target_notional_quote: Optional[float]  # Target converted to book quote currency
-    target_qty: Optional[float]  # Target in base asset units (if qty mode)
+    target_notional_quote: Optional[float]
+    target_qty: Optional[float]
     fx_usd_hkd: float
-    applied_fade_rate: float  # Primary fade rate applied to main metrics (default 0.0)
+    applied_fade_rate: float
 
     # Book top & Level-1 liquidity ("screen price illusion" metrics)
     top_bid: float
     top_ask: float
     mid_price: float
     spread_bp: float
-    top_price: float  # Level-1 price in quote currency
-    top_price_usd: float  # Level-1 price in USD
-    top_price_hkd: float  # Level-1 price in HKD
-    level1_qty: float  # Quantity resting at Level 1
-    level1_notional_usd: float  # USD notional resting at Level 1
-    level1_notional_hkd: float  # HKD notional resting at Level 1
-    level1_fill_pct: float  # % of target order that Level 1 alone can satisfy (0~100)
+    top_price: float
+    top_price_usd: float
+    top_price_hkd: float
+    level1_qty: float
+    level1_notional_usd: float
+    level1_notional_hkd: float
+    level1_fill_pct: float
 
-    # Execution metrics (in book quote currency, USD, and HKD)
+    # Execution metrics (static book)
     filled_qty: float
     cost_quote: float
     cost_usd: float
@@ -133,26 +178,26 @@ class SlippageResult:
     last_price_usd: float
     last_price_hkd: float
 
-    # Extra cost vs Level-1 screen price (OTC Block Trade comparison metrics)
-    vwap_extra_per_coin_usd: float  # |vwap_usd - top_price_usd| per 1 base coin
-    vwap_extra_per_coin_hkd: float  # |vwap_hkd - top_price_hkd| per 1 base coin
-    last_extra_per_coin_usd: float  # |last_price_usd - top_price_usd| per 1 base coin
-    last_extra_per_coin_hkd: float  # |last_price_hkd - top_price_hkd| per 1 base coin
-    slippage_loss_usd: float  # Total extra USD lost due to walking book vs Level-1 price
-    slippage_loss_hkd: float  # Total extra HKD lost due to walking book vs Level-1 price
-    taker_fee_bp: float  # Assumed exchange taker fee in bp (e.g. 5.0 or 10.0)
-    taker_fee_usd: float  # Exchange taker fee in USD
-    taker_fee_hkd: float  # Exchange taker fee in HKD
-    all_in_cost_bp: float  # vwap_slippage_bp + taker_fee_bp
-    all_in_loss_usd: float  # slippage_loss_usd + taker_fee_usd
-    all_in_loss_hkd: float  # slippage_loss_hkd + taker_fee_hkd
-    all_in_vwap_usd: float  # Effective all-in price per coin including taker fee
+    # Extra cost vs Level-1 screen price
+    vwap_extra_per_coin_usd: float
+    vwap_extra_per_coin_hkd: float
+    last_extra_per_coin_usd: float
+    last_extra_per_coin_hkd: float
+    slippage_loss_usd: float
+    slippage_loss_hkd: float
+    taker_fee_bp: float
+    taker_fee_usd: float
+    taker_fee_hkd: float
+    all_in_cost_bp: float
+    all_in_loss_usd: float
+    all_in_loss_hkd: float
+    all_in_vwap_usd: float
 
-    # Slippage metrics (positive bp = adverse execution cost relative to reference)
+    # Slippage metrics
     vwap_slippage_bp: float
     last_slippage_bp: float
     vwap_vs_mid_bp: float
-    signed_vwap_diff_bp: float  # (top_price - vwap) / top_price * 1e4 (compatible with legacy script)
+    signed_vwap_diff_bp: float
 
     # Book capacity & fill status
     levels_used: int
@@ -161,16 +206,17 @@ class SlippageResult:
     book_side_total_usd: float
     book_side_total_hkd: float
     book_side_total_qty: float
-    fill_ratio: float  # 0.0 ~ 1.0
+    fill_ratio: float
     depth_exhausted: bool
 
-    # Depth ladder & Market Maker withdrawal stress-test scenarios
+    # Depth ladder, MM withdrawal scenarios, and realistic full-chain breakdown vs OTC
     depth_bands: List[DepthBand] = field(default_factory=list)
     fade_scenarios: List[FadeScenario] = field(default_factory=list)
+    real_breakdown: Optional[RealExecutionBreakdown] = None
     latency_ms: float = 0.0
     sequence_id: Optional[str] = None
     note: str = (
-        "静态盘口估算，真正在盘面扫单时高频做市商会动态撤单，实际滑点通常显著高于静态值"
+        "静态盘口滑点仅反映挂单不动的理想假象；真实大单进场会触发做市商毫秒级撤空前排与退避重挂(Price Retreat)、HFT动量抢跑、Taker手续费及USDT换汇损耗"
     )
     error: Optional[str] = None
 
@@ -188,7 +234,6 @@ class VerificationReport:
     samples_count: int
     interval_sec: float
 
-    # 1. Book structural integrity
     is_crossed: bool
     bids_strictly_descending: bool
     asks_strictly_ascending: bool
@@ -199,18 +244,16 @@ class VerificationReport:
     sequence_monotonic: bool
     exchange_clock_skew_ms: Optional[float]
 
-    # 2. Public trade alignment check
     latest_trade_price: Optional[float]
     latest_trade_ts_ms: Optional[int]
     trade_vs_mid_bp: Optional[float]
     trade_within_inside_spread_or_10bp: Optional[bool]
 
-    # 3. Multi-snapshot persistence / anti-spoofing stability
     depth_10bp_usd_samples: List[float]
     depth_25bp_usd_samples: List[float]
-    depth_10bp_cv_pct: float  # Coefficient of variation (%) across snapshots
+    depth_10bp_cv_pct: float
     depth_25bp_cv_pct: float
-    level_retention_ratio: float  # Fraction of top-50 price levels remaining present across consecutive snapshots
+    level_retention_ratio: float
     simulated_slippage_bp_samples: List[float]
     simulated_slippage_bp_min: Optional[float]
     simulated_slippage_bp_max: Optional[float]

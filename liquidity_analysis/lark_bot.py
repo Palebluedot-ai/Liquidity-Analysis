@@ -107,7 +107,20 @@ class LiquidityBotHandlers:
                     default_exchange=str(av.get("exchange") or "binance,okx"),
                     default_otc_bp=str(av.get("otc_quote_bp") or "30"),
                 )
-                return self._card_response(card, P2CardActionTriggerResponse)
+
+                def _open_worker() -> None:
+                    try:
+                        self._send_to_user(open_id, card)
+                    except Exception:
+                        logger.exception("发送新测算表单失败")
+
+                # Returning a card here would replace the report being clicked.
+                self._background(_open_worker)
+                return self._card_response(
+                    None,
+                    P2CardActionTriggerResponse,
+                    toast="正在发送新测算表单，原报告已保留",
+                )
 
             if action == ACTION_SUBMIT_QUERY or form:
                 params = parse_lark_form_params(form)
@@ -156,6 +169,14 @@ class LiquidityBotHandlers:
 
                 def _verify_worker() -> None:
                     try:
+                        self._send_to_user(
+                            open_id,
+                            notice_card(
+                                "🔍 正在执行多帧盘口采样与真伪验证…",
+                                f"正在对 **{ex.upper()} ({sym})** 连续采样 3 次盘口并比对最新逐笔成交，约需 3~4 秒…",
+                                template="blue",
+                            ),
+                        )
                         rep = verify_orderbook(
                             exchange=ex,
                             symbol=sym,
@@ -172,11 +193,7 @@ class LiquidityBotHandlers:
 
                 self._background(_verify_worker)
                 return self._card_response(
-                    notice_card(
-                        "🔍 正在执行多帧盘口采样与真伪验证…",
-                        f"正在对 **{ex.upper()} ({sym})** 连续采样 3 次盘口并比对最新逐笔成交，约需 3~4 秒…",
-                        template="blue",
-                    ),
+                    None,
                     P2CardActionTriggerResponse,
                     toast="正在采样验证 Maker 挂单…",
                 )
@@ -192,9 +209,12 @@ class LiquidityBotHandlers:
 
     @staticmethod
     def _card_response(
-        card: Dict[str, Any], resp_cls: Any, *, toast: str | None = None
+        card: Dict[str, Any] | None, resp_cls: Any, *, toast: str | None = None
     ) -> Any:
-        payload: Dict[str, Any] = {"card": {"type": "raw", "data": card}}
+        # Omit `card` to acknowledge an interaction without replacing its message.
+        payload: Dict[str, Any] = {}
+        if card is not None:
+            payload["card"] = {"type": "raw", "data": card}
         if toast:
             payload["toast"] = {"type": "success", "content": toast}
         return resp_cls(payload)

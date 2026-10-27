@@ -25,6 +25,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import sqlite3
 import threading
 from typing import Any, Callable, Dict
 
@@ -65,6 +66,38 @@ def _run_in_thread(fn: Callable[[], None]) -> None:
     threading.Thread(target=fn, daemon=True).start()
 
 
+class EventReceipts:
+    """Atomically claim events, optionally retaining receipts across restarts."""
+
+    def __init__(self, path: Path | None = None) -> None:
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._db = sqlite3.connect(
+            str(path) if path is not None else ":memory:",
+            timeout=1.0,
+            check_same_thread=False,
+        )
+        with self._db:
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS received_events "
+                "(kind TEXT NOT NULL, event_key TEXT NOT NULL, "
+                "PRIMARY KEY (kind, event_key))"
+            )
+
+    def claim(self, kind: str, event_key: str) -> bool:
+        with self._lock, self._db:
+            inserted = self._db.execute(
+                "INSERT OR IGNORE INTO received_events VALUES (?, ?)",
+                (kind, event_key),
+            )
+            return inserted.rowcount == 1
+
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
+
+
 class LiquidityBotHandlers:
     """Lark message and interactive card callback handlers."""
 
@@ -72,15 +105,45 @@ class LiquidityBotHandlers:
         self,
         client: Any,
         background: Callable[[Callable[[], None]], None] = _run_in_thread,
+        receipts: EventReceipts | None = None,
     ) -> None:
         self._client = client
         self._background = background
+        self._receipts = receipts if receipts is not None else EventReceipts()
 
     def on_message(self, data: Any) -> None:
-        """When user sends any message to the bot, send the interactive selection card."""
-        chat_id = data.event.message.chat_id
-        card = build_query_card()
-        self._send_to_chat(chat_id, card)
+        """Acknowledge each human message promptly and send its form once."""
+        event = getattr(data, "event", None)
+        message = getattr(event, "message", None)
+        sender_type = getattr(getattr(event, "sender", None), "sender_type", None)
+        message_id = getattr(message, "message_id", None)
+        chat_id = getattr(message, "chat_id", None)
+        event_id = getattr(getattr(data, "header", None), "event_id", None)
+        logger.info(
+            "收到消息事件 event_id=%s message_id=%s sender_type=%s message_type=%s create_time=%s",
+            event_id, message_id, sender_type,
+            getattr(message, "message_type", None), getattr(message, "create_time", None),
+        )
+        if sender_type != "user":
+            logger.info("忽略非用户消息 message_id=%s sender_type=%s", message_id, sender_type)
+            return
+        if not message_id or not chat_id:
+            logger.warning("忽略缺少 message_id/chat_id 的消息 event_id=%s", event_id)
+            return
+        # Lark message redeliveries can have a different event_id: dedupe by message_id.
+        if not self._receipts.claim("message", message_id):
+            logger.info("忽略重复消息 message_id=%s event_id=%s", message_id, event_id)
+            return
+
+        def _message_worker() -> None:
+            logger.info("用户消息触发查询卡片 message_id=%s", message_id)
+            try:
+                self._send_to_chat(chat_id, build_query_card())
+            except Exception:
+                logger.exception("回复查询卡片失败 message_id=%s", message_id)
+
+        # Network I/O must not delay the SDK's event acknowledgment.
+        self._background(_message_worker)
 
     def on_card_action(self, data: Any) -> Any:
         """
@@ -91,8 +154,19 @@ class LiquidityBotHandlers:
             P2CardActionTriggerResponse,
         )
 
+        event_id = getattr(getattr(data, "header", None), "event_id", None)
         action_value = data.event.action.value
         action = action_value.get("action", "") if isinstance(action_value, dict) else ""
+        logger.info(
+            "收到卡片回调 event_id=%s action=%s",
+            event_id, action,
+        )
+        if event_id and not self._receipts.claim("card", event_id):
+            logger.info("忽略重复卡片回调 event_id=%s", event_id)
+            return self._card_response(
+                None, P2CardActionTriggerResponse, toast="操作已接收，无需重复提交",
+            )
+
         form = data.event.action.form_value or {}
         open_id = data.event.operator.open_id
 
@@ -109,6 +183,7 @@ class LiquidityBotHandlers:
                 )
 
                 def _open_worker() -> None:
+                    logger.info("卡片按钮触发新查询表单 event_id=%s", event_id)
                     try:
                         self._send_to_user(open_id, card)
                     except Exception:
@@ -126,6 +201,7 @@ class LiquidityBotHandlers:
                 params = parse_lark_form_params(form)
 
                 def _worker() -> None:
+                    logger.info("卡片提交触发测算 event_id=%s", event_id)
                     try:
                         results = compare_exchanges(
                             symbol=params["symbol"],
@@ -168,6 +244,7 @@ class LiquidityBotHandlers:
                 notional = float(av.get("notional") or 1_000_000)
 
                 def _verify_worker() -> None:
+                    logger.info("卡片按钮触发挂单验证 event_id=%s", event_id)
                     try:
                         self._send_to_user(
                             open_id,
@@ -242,9 +319,16 @@ class LiquidityBotHandlers:
             )
             .build()
         )
+        logger.info("开始发送卡片 receive_id_type=%s receive_id=%s", receive_id_type, receive_id)
         response = self._client.im.v1.message.create(request)
         if not response.success():
             logger.error("发送飞书卡片失败: %s %s", response.code, response.msg)
+        else:
+            logger.info(
+                "发送卡片成功 receive_id_type=%s receive_id=%s message_id=%s",
+                receive_id_type, receive_id,
+                getattr(getattr(response, "data", None), "message_id", None),
+            )
 
 
 def main() -> None:
@@ -252,7 +336,7 @@ def main() -> None:
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        format="%(asctime)s %(levelname)-7s %(name)s [%(threadName)s]: %(message)s",
     )
 
     app_id = os.environ.get("LARK_APP_ID", "").strip()
@@ -285,7 +369,12 @@ def main() -> None:
         )
         .build()
     )
-    handlers = LiquidityBotHandlers(client=rest_client)
+    state_dir = Path(os.environ.get(
+        "LARK_STATE_DIR", str(Path(__file__).resolve().parent.parent / ".runtime" / "lark"),
+    ))
+    handlers = LiquidityBotHandlers(
+        client=rest_client, receipts=EventReceipts(state_dir / "received-events.sqlite3"),
+    )
 
     event_handler = (
         lark.EventDispatcherHandler.builder("", "")

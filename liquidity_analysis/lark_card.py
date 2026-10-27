@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional
 
 from .engine import (
     DEFAULT_OTC_QUOTE_BP,
-    build_otc_pitch_lines,
     compare_exchanges,
 )
 from .exchanges import SUPPORTED_EXCHANGES
@@ -276,8 +275,116 @@ def build_query_card(
     }
 
 
+def _comparison_table(columns: List[tuple[str, str]], rows: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Native tables are body-level elements, never nested inside panels."""
+    return {
+        "tag": "table", "page_size": 5, "row_height": "low", "freeze_first_column": True,
+        "columns": [{"name": key, "display_name": label, "data_type": "text",
+                     "width": "auto", "horizontal_align": "left"} for key, label in columns],
+        "rows": rows,
+    }
+
+
+def _collapsed(title: str, content: str) -> Dict[str, Any]:
+    return {"tag": "collapsible_panel", "expanded": False,
+            "header": {"title": {"tag": "plain_text", "content": title}},
+            "elements": [_text(content)]}
+
+
+def _build_otc_pitch_elements(results: List[SlippageResult]) -> List[Dict[str, Any]]:
+    """Separate comparison, calculation inputs, historical evidence and copyable pitch."""
+    valid = [r for r in results if not r.error and r.real_breakdown is not None]
+    if not valid:
+        return []
+    elements = [{"tag": "hr"}, _text("**三、💡 OTC Block Trade 客户对比话术**", "heading"),
+        _text("**1. 为什么静态滑点不足以代表执行成本？**\n"
+              "静态 L2 快照只展示当前挂单。大单执行还需考虑退价与冲击、拆单时间风险、手续费与换汇损耗。"),
+        _text("**2. 当前交易成本对比**\n单位：bp；差额为盘面估算成本减 OTC 报价，正值表示 OTC 较低。")]
+    rows, strategies, costs, histories, history_details, pitches = [], [], [], [], [], []
+    states = [("normal_calm", "正常震荡"), ("momentum_chase", "上涨追高"),
+              ("extreme_stampede", "极端踩踏"), ("contrarian_dip", "逆势交易")]
+    for r in valid:
+        b = r.real_breakdown
+        assert b is not None
+        rows.append({"exchange": r.exchange_label, "cost": f"{b.total_orderbook_cost_bp:.1f}",
+                     "otc": f"{b.otc_quote_bp:.1f}",
+                     "difference": f"{b.otc_savings_bp:+.1f} / ${b.otc_savings_usd:+,.0f}"})
+        strategies.append({"exchange": r.exchange_label, "sweep": f"{b.strategy_sweep_1m_bp:.1f}",
+                           "optimal": f"{b.strategy_optimal_bp:.1f} / {b.optimal_exec_mins:.1f}m",
+                           "slow": f"{b.strategy_slow_twap_bp:.1f} / {b.slow_twap_mins:.0f}m"})
+        top, worse = ("卖一", "多付") if r.side == "buy" else ("买一", "少收")
+        costs.append(_collapsed(f"{r.exchange_label}｜五项成本与计算参数", "\n".join([
+            f"**{r.exchange_label} · {r.symbol}**",
+            f"① 静态滑点：{b.static_slippage_bp:.1f} bp",
+            f"② 做市商退价与价格冲击：{b.mm_retreat_bp:.1f} bp",
+            f"③ 拆单时间风险：{b.hft_frontrun_bp:.1f} bp（{b.twap_exec_mins:.1f} 分钟）",
+            f"④ Taker 手续费：{b.taker_fee_bp:.1f} bp",
+            f"⑤ 法币／USDT 转换损耗：{b.fiat_usdt_friction_bp:.1f} bp",
+            f"其中 USDT 盘口滑点 {b.usdt_book_slippage_bp:.1f} bp；基差 {b.usdt_basis_bp:.1f} bp",
+            f"**估算总成本：{b.total_orderbook_cost_bp:.1f} bp / ${b.total_orderbook_cost_usd:,.0f} / HK${b.total_orderbook_cost_hkd:,.0f}**",
+            f"全包均价：${b.realistic_all_in_vwap_usd:,.2f}；较{top}每 {r.base_asset} {worse} ${b.realistic_extra_per_coin_usd:,.2f}",
+            f"OTC 差额：{b.otc_savings_bp:+.1f} bp / ${b.otc_savings_usd:+,.0f} / HK${b.otc_savings_hkd:+,.0f}",
+            f"每 {r.base_asset} 差额：${b.otc_savings_per_coin_usd:+,.2f}",
+            "\n**盘口与模型输入**",
+            f"{top}：${r.top_price_usd:,.2f}；数量 {r.level1_qty:,.4f} {r.base_asset}（占本单 {r.level1_fill_pct:.1f}%）",
+            f"10bp 内微网格碎单占比：{b.micro_order_pct:.0f}%",
+            f"分钟成交额：${b.avg_1m_vol_usd:,.0f}；分钟净流 OFI：${b.avg_1m_ofi_usd:,.0f}",
+            f"订单／OFI：{b.order_to_1m_ofi_multiple:.1f}x；10bp 挂单／成交量：{b.display_to_trade_ratio:.1f}x",
+            f"σ_1m：{b.sigma_1m_bp:.2f} bp；Y_75：{b.empirical_impact_y:.2f}",
+            f"冲击留存参数：{b.permanent_impact_ratio:.0%}；永续对冲成本参数：{b.mm_perp_hedge_floor_bp:.1f} bp",
+        ])))
+        row = {"exchange": r.exchange_label, **{key: "—" for key, _ in states}}
+        hm = b.historical_matrix
+        if not hm or not hm.scenarios:
+            history_details.append(_collapsed(f"{r.exchange_label}｜历史数据", "暂无历史行情数据。"))
+        else:
+            detail = [f"**数据区间：{hm.span_start_utc[:10]}～{hm.span_end_utc[:10]}（UTC）**",
+                      f"覆盖：{hm.horizon_days} 天；K 线：{hm.stage2_high_freq_bars:,} 根；频率：{hm.high_freq_interval}"]
+            for sc in hm.scenarios:
+                row[sc.scenario_key] = f"{sc.est_all_in_median_bp:.1f} / {sc.est_all_in_p90_bp:.1f}"
+                detail.append(f"{dict(states).get(sc.scenario_key, sc.scenario_label)}：N={sc.sample_count:,}")
+            detail.append("\n**历史大单案例**")
+            cases_found = False
+            for sc in hm.scenarios:
+                if sc.scenario_key not in ("momentum_chase", "extreme_stampede") or not sc.representative_cases:
+                    continue
+                cases_found = True
+                c = sc.representative_cases[0]
+                detail.extend([f"\n**{dict(states)[sc.scenario_key]}**", f"时间：{c.dt}",
+                    f"{c.dir} 净吃单：${c.abs_net_usd / 1e6:.2f}M",
+                    f"瞬时冲击：{c.peak_bp:.1f} bp；收盘留存：{c.perm_bp:.1f} bp"])
+            if not cases_found:
+                detail.append("暂无代表性案例。")
+            history_details.append(_collapsed(f"{r.exchange_label}｜样本与历史案例", "\n".join(detail)))
+        histories.append(row)
+        comparison = (f"OTC 估算节省 {b.otc_savings_bp:.1f} bp，约 ${b.otc_savings_usd:,.0f}。"
+                      if b.otc_savings_bp > 0 else
+                      f"盘面估算成本比 OTC 低 {abs(b.otc_savings_bp):.1f} bp。" if b.otc_savings_bp < 0 else
+                      "两者估算成本持平。")
+        pitches.append(_collapsed(f"{r.exchange_label}｜复制话术",
+            f"本次在 {r.exchange_label} 的盘面全口径估算成本为 {b.total_orderbook_cost_bp:.1f} bp，"
+            f"OTC 参考报价为 {b.otc_quote_bp:.1f} bp。{comparison}"
+            f"模型最优拆单成本为 {b.strategy_optimal_bp:.1f} bp，执行时间约 {b.optimal_exec_mins:.1f} 分钟。"))
+    elements.append(_comparison_table([("exchange", "交易所"), ("cost", "盘面估算"),
+                                      ("otc", "OTC"), ("difference", "差额 bp / USD")], rows))
+    elements.extend(costs)
+    elements.extend([_text("**3. 算法执行对比**\n单位：bp；最优与慢速列同时列出执行分钟数。"),
+        _comparison_table([("exchange", "交易所"), ("sweep", "1m 扫盘"),
+                           ("optimal", "最优 bp / 时间"), ("slow", "TWAP bp / 时间")], strategies),
+        _text("**4. 历史行情下的执行成本**\n单元格：中位数／P90，单位 bp。区间、样本量与案例见折叠详情。"),
+        _comparison_table([("exchange", "交易所"), *states], histories)])
+    elements.extend(history_details)
+    elements.append(_text("**5. 可复制客户话术**\n按交易所展开后复制；使用本次报价与测算结果。"))
+    elements.extend(pitches)
+    elements.append(_collapsed("模型与计算口径",
+        "价格冲击采用实盘 K 线校准的 Square-Root 模型，拆单时间风险采用 Almgren-Chriss 模型。\n"
+        "Glosten-Milgrom 与 Avellaneda-Stoikov 用于解释逆向选择、库存风险和报价调整。\n"
+        "表中为本次模型估算；历史案例的收盘留存指该 K 线收盘时的价格变化。"))
+    return elements
+
+
 def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
-    """Render a list of `SlippageResult` into a Lark Schema 2.0 Card proving OTC Block Trade advantage."""
+    """Render estimates and per-exchange details into a Lark Schema 2.0 card."""
     if not results:
         return error_card("未获取到任何交易所盘口数据，请检查币对名称或重试。")
 
@@ -355,11 +462,6 @@ def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
             f"**`${b.realistic_all_in_vwap_usd:,.2f}`** ({worse_label} **`+${b.realistic_extra_per_coin_usd:,.2f}/{r.base_asset}`**) |"
         )
 
-    pitch_lines = build_otc_pitch_lines(results)
-    if pitch_lines:
-        lines.append("\n---\n### 三、💡 OTC Block Trade 客户对比话术（可直接复制）")
-        lines.extend(pitch_lines)
-
     ex_str = ",".join(r.exchange for r in results if not r.error) or "binance,okx"
     first_valid_ex = next((r.exchange for r in results if not r.error), "binance")
     amt_str = str(int(first.target_notional_input or 1_000_000))
@@ -376,6 +478,7 @@ def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
         "body": {
             "elements": [
                 _text("\n".join(lines)),
+                *_build_otc_pitch_elements(results),
                 _callback_button(
                     "🔄 重新选择参数 / 测算其他币对与金额",
                     {

@@ -29,26 +29,35 @@ def test_all_exchanges_retained_and_details_collapsed():
     card = build_result_card(results)
     elements = card['body']['elements']
     tables = [e for e in elements if e['tag'] == 'table']
-    assert len(tables) == 3
-    for table in tables:
-        assert [row['exchange'] for row in table['rows']] == [r.exchange_label for r in results]
+    assert len(tables) == 1
+    assert len(tables[0]['columns']) == 2
+    assert [row['exchange'] for row in tables[0]['rows']] == [r.exchange_label for r in results]
     for result, row in zip(results, tables[0]['rows']):
         assert row['cost'] == f'{result.real_breakdown.total_orderbook_cost_bp:.1f}'
-    for result, row in zip(results, tables[2]['rows']):
-        for scenario in result.real_breakdown.historical_matrix.scenarios:
-            assert row[scenario.scenario_key] == f'{scenario.est_all_in_median_bp:.1f} / {scenario.est_all_in_p90_bp:.1f}'
+    text = '\n'.join(e['content'] for e in elements if e['tag'] == 'markdown')
+    assert '|---' not in text
+    for result in results:
+        b = result.real_breakdown
+        assert f'**{result.exchange_label} · {result.symbol}**' in text
+        for value in (b.static_slippage_bp, b.mm_retreat_bp, b.hft_frontrun_bp,
+                      b.taker_fee_bp, b.fiat_usdt_friction_bp):
+            assert f'{value:.1f} bp' in text
+        assert f'{b.strategy_optimal_bp:.1f} bp（{b.optimal_exec_mins:.1f}' in text
+        for scenario in b.historical_matrix.scenarios:
+            assert f'{scenario.est_all_in_median_bp:.1f} / {scenario.est_all_in_p90_bp:.1f}' in text
     panels = [e for e in elements if e['tag'] == 'collapsible_panel']
-    assert len(panels) == 16
+    assert len(panels) == 21
     assert all(p['expanded'] is False for p in panels)
     assert all(e['tag'] == 'markdown' for p in panels for e in p['elements'])
-    for result, panel in zip(results, panels[5:10]):
-        text = panel['elements'][0]['content']
+    history_panels = [p for p in panels if '样本与历史案例' in p['header']['title']['content']]
+    for result, panel in zip(results, history_panels):
+        detail = panel['elements'][0]['content']
         matrix = result.real_breakdown.historical_matrix
-        assert matrix.span_start_utc[:10] in text
+        assert matrix.span_start_utc[:10] in detail
         for scenario in matrix.scenarios:
-            assert f'N={scenario.sample_count:,}' in text
+            assert f'N={scenario.sample_count:,}' in detail
             if scenario.scenario_key in ('momentum_chase', 'extreme_stampede') and scenario.representative_cases:
-                assert scenario.representative_cases[0].dt in text
+                assert scenario.representative_cases[0].dt in detail
     # Match the application message envelope, including escaped card JSON.
     payload = {'receive_id': 'ou_test', 'msg_type': 'interactive',
                'content': json.dumps(card, ensure_ascii=False)}
@@ -65,8 +74,12 @@ def test_single_exchange_missing_history_and_signed_copy(side, savings):
     failed = replace(result, exchange='failed', exchange_label='Failed', error='unavailable')
     elements = build_result_card([failed, result])['body']['elements']
     tables = [e for e in elements if e['tag'] == 'table']
-    assert all(len(t['rows']) == 1 for t in tables)
-    assert tables[2]['rows'][0]['normal_calm'] == '—'
+    assert len(tables) == 1
+    assert len(tables[0]['rows']) == 2
+    assert tables[0]['rows'][0]['cost'] == '测算失败'
+    text = '\n'.join(e['content'] for e in elements if e['tag'] == 'markdown')
+    assert '正常震荡：—' in text
+    assert 'unavailable' in text
     panels = [e for e in elements if e['tag'] == 'collapsible_panel']
     detail = panels[0]['elements'][0]['content']
     assert ('多付' if side == 'buy' else '少收') in detail
@@ -78,4 +91,8 @@ def test_single_exchange_missing_history_and_signed_copy(side, savings):
 def test_empty_and_failed_results_have_no_pitch_tables():
     assert build_result_card([])['header']['template'] == 'red'
     failed = replace(make_result(), error='unavailable')
-    assert not any(e['tag'] == 'table' for e in build_result_card([failed])['body']['elements'])
+    elements = build_result_card([failed])['body']['elements']
+    tables = [e for e in elements if e['tag'] == 'table']
+    assert len(tables) == 1
+    assert tables[0]['rows'][0]['cost'] == '测算失败'
+    assert not any(e['tag'] == 'collapsible_panel' for e in elements)

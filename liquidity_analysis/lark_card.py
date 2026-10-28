@@ -300,26 +300,21 @@ def _build_otc_pitch_elements(results: List[SlippageResult]) -> List[Dict[str, A
         _text("**1. 为什么静态滑点不足以代表执行成本？**\n"
               "静态 L2 快照只展示当前挂单。大单执行还需考虑退价与冲击、拆单时间风险、手续费与换汇损耗。"),
         _text("**2. 当前交易成本对比**\n单位：bp；差额为盘面估算成本减 OTC 报价，正值表示 OTC 较低。")]
-    rows, strategies, costs, histories, history_details, pitches = [], [], [], [], [], []
+    strategies, costs, histories, history_details, pitches = [], [], [], [], []
     states = [("normal_calm", "正常震荡"), ("momentum_chase", "上涨追高"),
               ("extreme_stampede", "极端踩踏"), ("contrarian_dip", "逆势交易")]
     for r in valid:
         b = r.real_breakdown
         assert b is not None
-        rows.append({"exchange": r.exchange_label, "cost": f"{b.total_orderbook_cost_bp:.1f}",
-                     "otc": f"{b.otc_quote_bp:.1f}",
-                     "difference": f"{b.otc_savings_bp:+.1f} / ${b.otc_savings_usd:+,.0f}"})
-        strategies.append({"exchange": r.exchange_label, "sweep": f"{b.strategy_sweep_1m_bp:.1f}",
-                           "optimal": f"{b.strategy_optimal_bp:.1f} / {b.optimal_exec_mins:.1f}m",
-                           "slow": f"{b.strategy_slow_twap_bp:.1f} / {b.slow_twap_mins:.0f}m"})
+        strategies.append(_text("\n".join([
+            f"**{r.exchange_label}**",
+            f"1m 扫盘：{b.strategy_sweep_1m_bp:.1f} bp",
+            f"最优拆单：{b.strategy_optimal_bp:.1f} bp（{b.optimal_exec_mins:.1f} 分钟）",
+            f"慢速 TWAP：{b.strategy_slow_twap_bp:.1f} bp（{b.slow_twap_mins:.0f} 分钟）",
+        ])))
         top, worse = ("卖一", "多付") if r.side == "buy" else ("买一", "少收")
-        costs.append(_collapsed(f"{r.exchange_label}｜五项成本与计算参数", "\n".join([
+        costs.append(_collapsed(f"{r.exchange_label}｜计算参数与金额明细", "\n".join([
             f"**{r.exchange_label} · {r.symbol}**",
-            f"① 静态滑点：{b.static_slippage_bp:.1f} bp",
-            f"② 做市商退价与价格冲击：{b.mm_retreat_bp:.1f} bp",
-            f"③ 拆单时间风险：{b.hft_frontrun_bp:.1f} bp（{b.twap_exec_mins:.1f} 分钟）",
-            f"④ Taker 手续费：{b.taker_fee_bp:.1f} bp",
-            f"⑤ 法币／USDT 转换损耗：{b.fiat_usdt_friction_bp:.1f} bp",
             f"其中 USDT 盘口滑点 {b.usdt_book_slippage_bp:.1f} bp；基差 {b.usdt_basis_bp:.1f} bp",
             f"**估算总成本：{b.total_orderbook_cost_bp:.1f} bp / ${b.total_orderbook_cost_usd:,.0f} / HK${b.total_orderbook_cost_hkd:,.0f}**",
             f"全包均价：${b.realistic_all_in_vwap_usd:,.2f}；较{top}每 {r.base_asset} {worse} ${b.realistic_extra_per_coin_usd:,.2f}",
@@ -356,7 +351,10 @@ def _build_otc_pitch_elements(results: List[SlippageResult]) -> List[Dict[str, A
             if not cases_found:
                 detail.append("暂无代表性案例。")
             history_details.append(_collapsed(f"{r.exchange_label}｜样本与历史案例", "\n".join(detail)))
-        histories.append(row)
+        histories.append(_text("\n".join([
+            f"**{r.exchange_label}**",
+            *[f"{label}：{row[key]}" for key, label in states],
+        ])))
         comparison = (f"OTC 估算节省 {b.otc_savings_bp:.1f} bp，约 ${b.otc_savings_usd:,.0f}。"
                       if b.otc_savings_bp > 0 else
                       f"盘面估算成本比 OTC 低 {abs(b.otc_savings_bp):.1f} bp。" if b.otc_savings_bp < 0 else
@@ -365,14 +363,11 @@ def _build_otc_pitch_elements(results: List[SlippageResult]) -> List[Dict[str, A
             f"本次在 {r.exchange_label} 的盘面全口径估算成本为 {b.total_orderbook_cost_bp:.1f} bp，"
             f"OTC 参考报价为 {b.otc_quote_bp:.1f} bp。{comparison}"
             f"模型最优拆单成本为 {b.strategy_optimal_bp:.1f} bp，执行时间约 {b.optimal_exec_mins:.1f} 分钟。"))
-    elements.append(_comparison_table([("exchange", "交易所"), ("cost", "盘面估算"),
-                                      ("otc", "OTC"), ("difference", "差额 bp / USD")], rows))
     elements.extend(costs)
-    elements.extend([_text("**3. 算法执行对比**\n单位：bp；最优与慢速列同时列出执行分钟数。"),
-        _comparison_table([("exchange", "交易所"), ("sweep", "1m 扫盘"),
-                           ("optimal", "最优 bp / 时间"), ("slow", "TWAP bp / 时间")], strategies),
-        _text("**4. 历史行情下的执行成本**\n单元格：中位数／P90，单位 bp。区间、样本量与案例见折叠详情。"),
-        _comparison_table([("exchange", "交易所"), *states], histories)])
+    elements.extend([_text("**3. 算法执行对比**\n单位：bp；各交易所纵向列出成本与执行时间。"),
+                     *strategies,
+                     _text("**4. 历史行情下的执行成本**\n数值：中位数／P90，单位 bp。区间、样本量与案例见折叠详情。"),
+                     *histories])
     elements.extend(history_details)
     elements.append(_text("**5. 可复制客户话术**\n按交易所展开后复制；使用本次报价与测算结果。"))
     elements.extend(pitches)
@@ -388,7 +383,7 @@ def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
     if not results:
         return error_card("未获取到任何交易所盘口数据，请检查币对名称或重试。")
 
-    first = results[0]
+    first = next((r for r in results if not r.error and r.real_breakdown), results[0])
     side_cn = "买入 (BUY / 吃卖盘 Asks)" if first.side == "buy" else "卖出 (SELL / 吃买盘 Bids)"
     worse_label = "比1档多付" if first.side == "buy" else "比1档少收"
     ccy = first.input_currency
@@ -403,64 +398,53 @@ def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
     else:
         target_str = f"{first.target_qty:,.4f} {first.base_asset}"
 
-    lines: List[str] = [
-        f"**标的**：`{first.base_asset}` ｜ **方向**：{side_cn}",
-        f"**目标规模**：{target_str} ｜ **对标 OTC 锁价**：**`{otc_bp:.0f} bp` (全包净价)**",
-        "\n---\n### 一、🔥 盘面五项真实全链路成本 vs OTC 锁价对标（180m实盘K线 + L2逐档实测）",
-        (
-            f"| 交易所 | ①静态L2滑点 | ②K线冲击溢价(MM撤单) | ③Almgren-Chriss拆单风险 | ④Taker费 | ⑤USDT双腿实测 | **盘面真实总成本** | **对比 OTC ({otc_bp:.0f}bp)** |\n"
-            "|---|---|---|---|---|---|---|---|"
-        ),
+    elements = [
+        _text(f"**标的**：{first.base_asset}\n**方向**：{side_cn}\n"
+              f"**目标规模**：{target_str}\n**对标 OTC 锁价**：{otc_bp:.0f} bp（全包净价）"),
+        _text("**一、交易所成本汇总**", "heading"),
     ]
-
+    elements.append(_comparison_table(
+        [("exchange", "交易所"), ("cost", "总成本 bp")],
+        [{"exchange": r.exchange_label,
+          "cost": f"{r.real_breakdown.total_orderbook_cost_bp:.1f}"
+          if not r.error and r.real_breakdown else "测算失败"} for r in results],
+    ))
+    elements.append(_text("**二、各交易所成本明细**\n180m 实盘 K 线 + L2 逐档实测", "heading"))
     for r in results:
+        elements.append({"tag": "hr"})
         if r.error or not r.real_breakdown:
-            lines.append(
-                f"| **{r.exchange_label}** (`{r.symbol}`) | - | - | - | - | - | - | ❌ 失败 |"
-            )
+            elements.append(_text(f"**{r.exchange_label} · {r.symbol}**\n❌ {r.error or '暂无成本明细'}"))
             continue
         b = r.real_breakdown
-        save_str = (
-            f"✅ **OTC 净省 {b.otc_savings_bp:.1f}bp (`${b.otc_savings_usd:,.0f}`)**"
-            if b.otc_savings_bp > 0
-            else f"⚠️ 接近 OTC (`{b.total_orderbook_cost_bp:.1f}bp`)"
+        comparison = (
+            f"OTC 估算节省 {b.otc_savings_bp:.1f} bp（${b.otc_savings_usd:,.0f}）"
+            if b.otc_savings_bp > 0 else
+            f"盘面估算成本比 OTC 低 {abs(b.otc_savings_bp):.1f} bp"
+            if b.otc_savings_bp < 0 else "两者估算成本持平"
         )
-        lines.append(
-            f"| **{r.exchange_label}** (`{r.symbol}`) | "
-            f"`{b.static_slippage_bp:.1f}bp` (吃{r.levels_used}档) | "
-            f"**`+{b.mm_retreat_bp:.1f}bp`** (`{b.order_to_1m_ofi_multiple:.1f}x` 1m净流) | "
-            f"**`+{b.hft_frontrun_bp:.1f}bp`** (拆单`{b.twap_exec_mins:.1f}m`) | "
-            f"`+{b.taker_fee_bp:.1f}bp` | "
-            f"`+{b.fiat_usdt_friction_bp:.1f}bp` | "
-            f"**`{b.total_orderbook_cost_bp:.1f} bp` (`${b.total_orderbook_cost_usd:,.0f}`)** | "
-            f"{save_str} |"
-        )
-
-    lines.extend(
-        [
-            "\n---\n### 二、📊 静态表层 vs 做市商撤单退价后每颗币额外差价（vs 第 1 档屏幕价）",
-            (
-                f"| 交易所 | 第1档价 (仅能满足%) | 静态理想 (0%撤单) | 常规HFT撤单+退价 | 剧烈撤单+HFT抢跑 | 盘面真实全包均价 |\n"
-                "|---|---|---|---|---|---|"
-            ),
-        ]
-    )
-
-    for r in results:
-        if r.error or not r.fade_scenarios or not r.real_breakdown:
-            continue
-        s0 = r.fade_scenarios[0]
-        s50 = r.fade_scenarios[1] if len(r.fade_scenarios) > 1 else s0
-        s70 = r.fade_scenarios[2] if len(r.fade_scenarios) > 2 else s0
-        b = r.real_breakdown
-        lines.append(
-            f"| **{r.exchange_label}** | "
-            f"`${r.top_price_usd:,.2f}` ({r.level1_fill_pct:.1f}%) | "
-            f"吃{s0.levels_used}档 / `+${s0.vwap_extra_per_coin_usd:,.2f}` ({s0.vwap_slippage_bp:.1f}bp) | "
-            f"吃{s50.levels_used}档 / **`+${s50.vwap_extra_per_coin_usd:,.2f}`** ({s50.vwap_slippage_bp:.1f}bp) | "
-            f"吃{s70.levels_used}档 / **`+${s70.vwap_extra_per_coin_usd:,.2f}`** ({s70.vwap_slippage_bp:.1f}bp) | "
-            f"**`${b.realistic_all_in_vwap_usd:,.2f}`** ({worse_label} **`+${b.realistic_extra_per_coin_usd:,.2f}/{r.base_asset}`**) |"
-        )
+        elements.append(_text("\n".join([
+            f"**{r.exchange_label} · {r.symbol}**",
+            f"**盘面真实总成本：{b.total_orderbook_cost_bp:.1f} bp（${b.total_orderbook_cost_usd:,.0f}）**",
+            f"**对比 OTC（{b.otc_quote_bp:.0f} bp）：{comparison}**",
+            f"① 静态 L2 滑点：{b.static_slippage_bp:.1f} bp（吃 {r.levels_used} 档）",
+            f"② K 线冲击溢价（MM 撤单）：{b.mm_retreat_bp:.1f} bp",
+            f"订单／1m 净流：{b.order_to_1m_ofi_multiple:.1f}x",
+            f"③ Almgren-Chriss 拆单风险：{b.hft_frontrun_bp:.1f} bp",
+            f"拆单时间：{b.twap_exec_mins:.1f} 分钟",
+            f"④ Taker 费：{b.taker_fee_bp:.1f} bp",
+            f"⑤ USDT 双腿实测：{b.fiat_usdt_friction_bp:.1f} bp",
+        ])))
+        if r.fade_scenarios:
+            scenarios = r.fade_scenarios
+            fade_lines = [f"第 1 档价：${r.top_price_usd:,.2f}（满足本单 {r.level1_fill_pct:.1f}%）"]
+            for label, scenario in zip(
+                ("静态理想（0% 撤单）", "常规 HFT 撤单与退价", "剧烈撤单与 HFT 抢跑"),
+                (scenarios[0], scenarios[min(1, len(scenarios) - 1)], scenarios[min(2, len(scenarios) - 1)]),
+            ):
+                fade_lines.extend([f"**{label}**", f"吃 {scenario.levels_used} 档；每币额外差价 ${scenario.vwap_extra_per_coin_usd:,.2f}；滑点 {scenario.vwap_slippage_bp:.1f} bp"])
+            fade_lines.extend([f"**盘面真实全包均价：${b.realistic_all_in_vwap_usd:,.2f}**",
+                               f"{worse_label}：${b.realistic_extra_per_coin_usd:,.2f}/{r.base_asset}"])
+            elements.append(_collapsed(f"{r.exchange_label}｜撤单情景与每币差价", "\n".join(fade_lines)))
 
     ex_str = ",".join(r.exchange for r in results if not r.error) or "binance,okx"
     first_valid_ex = next((r.exchange for r in results if not r.error), "binance")
@@ -477,7 +461,7 @@ def build_result_card(results: List[SlippageResult]) -> Dict[str, Any]:
         },
         "body": {
             "elements": [
-                _text("\n".join(lines)),
+                *elements,
                 *_build_otc_pitch_elements(results),
                 _callback_button(
                     "🔄 重新选择参数 / 测算其他币对与金额",
